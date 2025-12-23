@@ -1,0 +1,14 @@
+# Force Unix line endings for all text files
+* text=auto eol=lf
+
+# Explicitly mark shell scripts
+*.sh text eol=lf
+
+# Keep markdown and text files with LF
+*.md text eol=lf
+*.txt text eol=lf
+
+# Binary files (no line ending conversion)
+*.png binary
+*.jpg binary
+*.gif binary
