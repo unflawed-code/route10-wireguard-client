@@ -37,23 +37,23 @@ Tested on Route10 firmware version `1.4o`.
 3. **Run the Script**:
 
     ```sh
-    Usage: ./wg-pbr.sh <interface_name> -c <config_file> -r <positive_number> -t <IPs_comma_separated>
+    Usage: ./wg-pbr.sh <interface_name> -c <config_file> -t <IPs_comma_separated> [-r <routing_table>]
       Arguments for configuration:
         <interface_name>:   WireGuard interface name (max 11 chars)
         -c, --conf <file>:      Relative or absolute path to the wg conf file
-        -r, --routing-table <N>: Positive number for the routing table
         -t, --target-ips <IPs>:  Comma-separated list of IPv4 addresses or subnets
+        -r, --routing-table <N>: (Optional) Routing table number, auto-allocated 100-199 if not provided
 
     Commands:
       ./wg-pbr.sh commit               Apply all staged WireGuard interface configurations.
-      ./wg-pbr.sh reapply              (Optional) Re-apply firewall rules for all registered interfaces.
+      ./wg-pbr.sh reapply              (Optional) Re-apply firewall rules for all registered interfaces (useful after boot).
     ```
 
     ```sh
-    # Stage one or more configurations
-    ./wg-pbr.sh wg0 -c /etc/wireguard/wg0.conf -r 100 -t 192.168.1.55
-    ./wg-pbr.sh wg1 -c /etc/wireguard/wgx.conf -r 110 -t 10.10.10.0/24
-    ./wg-pbr.sh wg2 -c /etc/wireguard/wgy.conf -r 120 -t 10.20.20.0/24, 10.50.50.50
+    # Stage one or more configurations (routing table auto-allocated if -r not specified)
+    ./wg-pbr.sh wg0 -c /etc/wireguard/wg0.conf -t 192.168.1.55
+    ./wg-pbr.sh wg1 -c /etc/wireguard/wgx.conf -t 10.10.10.0/24
+    ./wg-pbr.sh wg2 -c /etc/wireguard/wgy.conf -r 120 -t 10.20.20.0/24,10.50.50.50
 
     # Apply all staged configurations
     ./wg-pbr.sh commit

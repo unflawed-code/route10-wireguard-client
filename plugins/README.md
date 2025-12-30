@@ -10,12 +10,11 @@ Hooks are called in the following order:
 
 | # | Hook | When Called | Arguments |
 | --- | ------ | ------------- | ----------- |
-| 1 | `allocate_routing_table` | Auto-allocate routing table | `$1`: INTERFACE_NAME. Sets: `ROUTING_TABLE_OVERRIDE` |
-| 2 | `pre_commit` | Before committing staged configs | (none) |
-| 3 | `pre_setup` | Before interface setup | `$1`: INTERFACE_NAME, `$2`: WG_REGISTRY |
-| 4 | `process_ipv6_prefix` | For non-/128 IPv6 prefixes | `$1`: ip6, `$2`: prefix_len, `$3`: addr_part |
-| 5 | `post_setup` | After interface setup | `$1`: INTERFACE_NAME |
-| 6 | `post_commit` | After all interfaces are up | (none) |
+| 1 | `pre_commit` | Before committing staged configs | (none) |
+| 2 | `pre_setup` | Before interface setup | `$1`: INTERFACE_NAME, `$2`: WG_REGISTRY |
+| 3 | `process_ipv6_prefix` | For non-/128 IPv6 prefixes | `$1`: ip6, `$2`: prefix_len, `$3`: addr_part |
+| 4 | `post_setup` | After interface setup | `$1`: INTERFACE_NAME |
+| 5 | `post_commit` | After all interfaces are up | (none) |
 
 ## Creating a Plugin
 
@@ -49,4 +48,4 @@ post_setup() {
 - **Return values**: Return 0 on success, non-zero on failure (warning is logged)
 - **Logging**: Use `echo` for user-facing output, `logger -t wireguard` for system logs
 - **Idempotent**: Plugins may be called multiple times; design accordingly
-- **No side effects**: Don't modify global variables or call `exit` (except `allocate_routing_table` which sets `ROUTING_TABLE_OVERRIDE`)
+- **No side effects**: Don't modify global variables or call `exit`

@@ -8,10 +8,13 @@
 # Convert IPv4 address to integer for subnet calculations
 # Usage: ip_to_int "192.168.1.1"
 ip_to_int() {
+    [ -z "$1" ] && echo "0" && return
     local a b c d
     IFS=. read -r a b c d <<EOF
 $1
 EOF
+    # Validate we got 4 octets
+    [ -z "$a" ] || [ -z "$b" ] || [ -z "$c" ] || [ -z "$d" ] && echo "0" && return
     echo "$(( (a << 24) | (b << 16) | (c << 8) | d ))"
 }
 

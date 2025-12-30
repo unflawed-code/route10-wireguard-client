@@ -4,16 +4,16 @@ set -e
 trap 'rm -f /tmp/neigh_*_$$' EXIT
 
 usage() {
-    echo "Usage: $0 <interface_name> -c <config_file> -r <positive_number> -t <IPs_comma_separated>"
+    echo "Usage: $0 <interface_name> -c <config_file> -t <IPs_comma_separated> [-r <routing_table>]"
     echo "  Arguments for configuration:"
     echo "    <interface_name>:   WireGuard interface name (max 11 chars)"
     echo "    -c, --conf <file>:      Relative or absolute path to the wg conf file"
-    echo "    -r, --routing-table <N>: Positive number for the routing table"
     echo "    -t, --target-ips <IPs>:  Comma-separated list of IPv4 addresses or subnets"
+    echo "    -r, --routing-table <N>: (Optional) Routing table number, auto-allocated 100-199 if not provided"
     echo ""
     echo "Commands:"
     echo "  $0 commit               Apply all staged WireGuard interface configurations."
-    echo "  $0 reapply              Re-apply firewall rules for all registered interfaces."
+    echo "  $0 reapply              (Optional) Re-apply firewall rules for all registered interfaces (useful after boot)."
     exit 1
 }
 
@@ -60,12 +60,11 @@ inject_common_lib() {
 # Run hook: sources all plugins and calls the hook function if defined
 # Usage: run_hook <hook_name> [args...]
 # Available hooks (in execution order):
-#   1. allocate_routing_table  - Auto-allocate routing table (args: INTERFACE_NAME) Sets: ROUTING_TABLE_OVERRIDE
-#   2. pre_commit              - Before committing staged configs (args: none)
-#   3. pre_setup               - Before interface setup (args: INTERFACE_NAME WG_REGISTRY)
-#   4. process_ipv6_prefix     - For non-/128 IPv6 prefixes (args: ip6, prefix_len, addr_part)
-#   5. post_setup              - After interface setup complete (args: INTERFACE_NAME)
-#   6. post_commit             - After all interfaces are up (args: none)
+#   1. pre_commit              - Before committing staged configs (args: none)
+#   2. pre_setup               - Before interface setup (args: INTERFACE_NAME WG_REGISTRY)
+#   3. process_ipv6_prefix     - For non-/128 IPv6 prefixes (args: ip6, prefix_len, addr_part)
+#   4. post_setup              - After interface setup complete (args: INTERFACE_NAME)
+#   5. post_commit             - After all interfaces are up (args: none)
 run_hook() {
     local hook_name="$1"
     shift
@@ -108,43 +107,123 @@ unregister_wg_interface() {
     sed -i "/|${iface}|/d" "$WG_MAC_STATE" 2>/dev/null || true
 }
 
+# Auto-allocate routing table (100-199 range for WireGuard)
+allocate_routing_table() {
+    local start=100
+    local end=199
+    local rt_tables="/etc/iproute2/rt_tables"
+    
+    local used_tables=""
+    if [ -f "$rt_tables" ]; then
+        used_tables=$(awk '{print $1}' "$rt_tables" 2>/dev/null | grep -E '^[0-9]+$' | sort -n)
+    fi
+    
+    # Check WireGuard registry (committed interfaces)
+    if [ -f "$WG_REGISTRY" ]; then
+        while IFS='|' read -r iface rt rest; do
+            used_tables="$used_tables $rt"
+        done < "$WG_REGISTRY"
+    fi
+    
+    # Check staging DB (staged but not yet committed interfaces)
+    if [ -f "$STAGING_DB" ]; then
+        while IFS='|' read -r iface cmd committed; do
+            # Extract routing table from staged command (--routing-table N)
+            staged_rt=$(echo "$cmd" | sed -n 's/.*--routing-table \([0-9]*\).*/\1/p')
+            [ -n "$staged_rt" ] && used_tables="$used_tables $staged_rt"
+        done < "$STAGING_DB"
+    fi
+    
+    local i=$start
+    while [ $i -le $end ]; do
+        if ! echo "$used_tables" | grep -qw "$i"; then
+            echo "$i"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    
+    echo ""
+    return 1
+}
+
 if [ "$1" = "commit" ]; then
     if [ -f "$STAGING_DB" ]; then
         echo "Committing staged configurations..."
         run_hook pre_commit
         # Use a temporary file for the updated DB
         touch "${STAGING_DB}.tmp"
+        NEW_IFACES=""  # Track only newly staged interfaces
         
-        while IFS='|' read -r iface cmd committed; do
+        # Use file descriptor 3 to prevent eval from consuming stdin
+        exec 3< "$STAGING_DB"
+        while IFS='|' read -r iface cmd committed <&3; do
             # Always try to apply configuration if it hasn't been successfully committed yet
             if [ "$committed" != "true" ]; then
                 echo "Applying configuration for $iface..."
                 if eval "$cmd --internal-exec"; then
                     committed="true"
+                    NEW_IFACES="$NEW_IFACES $iface"  # This is a newly applied interface
                 else
                     echo "Error applying configuration for $iface"
                     committed="false"
                 fi
             fi
             
-            # Use the status from the setup attempt
-            if [ "$committed" = "true" ]; then
-                echo "Bringing up $iface..."
-                # Commit UCI changes for this interface
-                uci commit network
-                uci commit firewall
-                
-                # Bring up the interface (redirects stdout/stderr to suppress errors if already up?) 
-                # Better to be verbose so user sees what's happening
-                ifup "$iface"
-                
-                # Write back with true status
-                echo "$iface|$cmd|true" >> "${STAGING_DB}.tmp"
-            else
-                echo "$iface|$cmd|false" >> "${STAGING_DB}.tmp"
-            fi
-        done < "$STAGING_DB"
+            # Write back with current status
+            echo "$iface|$cmd|$committed" >> "${STAGING_DB}.tmp"
+        done
+        exec 3<&-
         mv "${STAGING_DB}.tmp" "$STAGING_DB"
+        
+        # Only bring up newly staged interfaces (don't restart already running ones)
+        for iface in $NEW_IFACES; do
+            echo "Bringing up $iface..."
+            # Commit UCI changes for this interface
+            uci commit network
+            uci commit firewall
+            
+            # Bring up the interface
+            ifup "$iface"
+        done
+        
+        # Setup DHCP hook if not already configured (required for roaming cleanup)
+        DHCP_HOOK="/etc/dnsmasq-dhcp-hook.sh"
+        SCRIPT_DIR=$(dirname "$0")
+        DHCP_HOOK_SRC="${SCRIPT_DIR}/lib/dnsmasq-dhcp-hook.sh"
+        
+        if [ -f "$DHCP_HOOK_SRC" ]; then
+            # Copy the hook script from the source file (avoids escaping issues)
+            if [ ! -f "$DHCP_HOOK" ] || ! cmp -s "$DHCP_HOOK_SRC" "$DHCP_HOOK"; then
+                echo "Setting up DHCP hotplug hook..."
+                cp "$DHCP_HOOK_SRC" "$DHCP_HOOK"
+                chmod +x "$DHCP_HOOK"
+            fi
+        fi
+        
+        # Configure dnsmasq to use the hook if not already set
+        current_hook=$(uci -q get dhcp.@dnsmasq[0].dhcpscript)
+        if [ "$current_hook" != "$DHCP_HOOK" ]; then
+            echo "Configuring dnsmasq to use DHCP hook..."
+            uci set dhcp.@dnsmasq[0].dhcpscript="$DHCP_HOOK"
+            uci commit dhcp
+            /etc/init.d/dnsmasq restart
+        fi
+        
+        # Deploy master DHCP hotplug script (handles roaming between VPN interfaces)
+        MASTER_DHCP_SRC="${SCRIPT_DIR}/lib/wg-master-dhcp.sh"
+        
+        if [ -f "$MASTER_DHCP_SRC" ]; then
+            if [ ! -f "$MASTER_DHCP_HOTPLUG" ] || ! cmp -s "$MASTER_DHCP_SRC" "$MASTER_DHCP_HOTPLUG" 2>/dev/null; then
+                echo "Deploying master DHCP hotplug script..."
+                mkdir -p "$(dirname "$MASTER_DHCP_HOTPLUG")"
+                cp "$MASTER_DHCP_SRC" "$MASTER_DHCP_HOTPLUG"
+                chmod +x "$MASTER_DHCP_HOTPLUG"
+            fi
+        else
+            echo "Warning: Master DHCP hotplug source not found at $MASTER_DHCP_SRC"
+        fi
+        
         run_hook post_commit
         echo "Commit complete. Interfaces brought up and firewall rules applied."
     else
@@ -236,12 +315,14 @@ if [ -z "$CONFIG_FILE" ]; then
 fi
 
 if [ -z "$ROUTING_TABLE_OVERRIDE" ]; then
-    # Try to auto-allocate via plugin hook
-    run_hook allocate_routing_table "$INTERFACE_NAME"
+    # Auto-allocate from 100-199 range
+    ROUTING_TABLE_OVERRIDE=$(allocate_routing_table)
     if [ -z "$ROUTING_TABLE_OVERRIDE" ]; then
-        echo "Error: --routing-table <positive_number> is required (no auto-allocator plugin found)"
-        usage
+        echo "Error: Could not allocate routing table (100-199 range exhausted)"
+        echo "Use -r <number> to specify your own routing table value"
+        exit 1
     fi
+    echo "Auto-allocated routing table: $ROUTING_TABLE_OVERRIDE"
 fi
 
 if [ -z "$VPN_IPS_OVERRIDE" ]; then
@@ -545,7 +626,12 @@ cat > /etc/hotplug.d/iface/99-${INTERFACE_NAME}-routing << 'EOF_IFACE_ROUTING'
 [ "$ACTION" = "ifup" ] || [ "$ACTION" = "fw-reload" ] || exit 0
 [ "$INTERFACE" = "INTERFACE_NAME_PLACEHOLDER" ] || exit 0
 
-trap 'rm -f /tmp/neigh_${WG_INTERFACE}_$$' EXIT
+# Acquire lock to prevent race conditions with other WireGuard interfaces
+LOCK_FILE="/tmp/wg_iface_routing.lock"
+exec 201>"$LOCK_FILE"
+flock -x 201 || exit 1
+
+trap 'rm -f /tmp/neigh_${WG_INTERFACE}_$$; flock -u 201' EXIT
 
 ROUTING_TABLE="ROUTING_TABLE_PLACEHOLDER"
 IPV6_SUPPORTED="IPV6_SUPPORTED_PLACEHOLDER"
@@ -1044,6 +1130,69 @@ if [ "$IPV6_SUPPORTED" = "1" ]; then
         
         logger -t wireguard "[$WG_INTERFACE] IPv6 DNS redirect configured to $first_dns"
     fi
+else
+    # IPv4-only tunnel: Proactively block IPv6 for ALL existing clients
+    # This prevents leaks from clients that already have DHCP leases (no event fires)
+    logger -t wireguard "[$WG_INTERFACE] IPv4-only: Proactively blocking IPv6 for existing VPN clients"
+    
+    PROCESSED_MACS_BLOCK=""
+    DHCP_LEASE_FILE=$(get_dhcp_lease_file)
+    
+    for item in $VPN_IPS; do
+        # Skip IPv6 addresses
+        echo "$item" | grep -q ":" && continue
+        
+        case "$item" in
+            */*) # Subnet - scan DHCP leases for clients
+                if [ -n "$DHCP_LEASE_FILE" ]; then
+                    while read -r exp mac ip host; do
+                        if is_in_subnet "$ip" "$item" && ! echo "$PROCESSED_MACS_BLOCK" | grep -q "$mac"; then
+                            PROCESSED_MACS_BLOCK="$PROCESSED_MACS_BLOCK $mac"
+                            logger -t wireguard "[$WG_INTERFACE] Blocking IPv6 for $ip ($mac) - IPv4-only tunnel"
+                            ip6tables -A $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP
+                            # Block IPv6 acquisition (RS and DHCPv6)
+                            ip6tables -C INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null || \
+                                ip6tables -A INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP
+                            ip6tables -C INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP 2>/dev/null || \
+                                ip6tables -A INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP
+                        fi
+                    done < "$DHCP_LEASE_FILE"
+                fi
+                
+                # Also check ARP table
+                ip neigh show > /tmp/neigh_block_${WG_INTERFACE}_$$
+                while read -r line; do
+                    ip=$(echo $line | awk '{print $1}')
+                    mac=$(echo $line | grep -o -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
+                    if [ -n "$mac" ] && is_in_subnet "$ip" "$item" && ! echo "$PROCESSED_MACS_BLOCK" | grep -q "$mac"; then
+                        PROCESSED_MACS_BLOCK="$PROCESSED_MACS_BLOCK $mac"
+                        logger -t wireguard "[$WG_INTERFACE] Blocking IPv6 for $ip ($mac) via ARP - IPv4-only tunnel"
+                        ip6tables -A $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP
+                        ip6tables -C INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null || \
+                            ip6tables -A INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP
+                        ip6tables -C INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP 2>/dev/null || \
+                            ip6tables -A INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP
+                    fi
+                done < /tmp/neigh_block_${WG_INTERFACE}_$$
+                rm -f /tmp/neigh_block_${WG_INTERFACE}_$$
+                ;;
+            *) # Single IP
+                mac=$(discover_mac_for_ip "$item")
+                if [ -n "$mac" ]; then
+                    logger -t wireguard "[$WG_INTERFACE] Blocking IPv6 for $item ($mac) - IPv4-only tunnel"
+                    ip6tables -A $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP
+                    ip6tables -C INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null || \
+                        ip6tables -A INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP
+                    ip6tables -C INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP 2>/dev/null || \
+                        ip6tables -A INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP
+                else
+                    logger -t wireguard "[$WG_INTERFACE] WARNING: Could not discover MAC for $item, IPv6 may leak"
+                fi
+                ;;
+        esac
+    done
+    
+    logger -t wireguard "[$WG_INTERFACE] IPv6 blocking applied for existing clients"
 fi
 
 # Create/Flush ipset on every ifup to prevent race condition
@@ -1256,230 +1405,19 @@ update_wg_registry "$INTERFACE_NAME" "$ROUTING_TABLE" "$VPN_IPS" "$IPV6_SUPPORTE
 # Remove old per-interface DHCP hotplug script if it exists
 rm -f "$DHCP_HOTPLUG_SCRIPT" 2>/dev/null
 
-# Create/update master DHCP hotplug script (always overwrite to ensure latest version)
-echo "Creating/updating master DHCP hotplug script: $MASTER_DHCP_HOTPLUG"
-cat > "$MASTER_DHCP_HOTPLUG" << 'EOF_MASTER_DHCP'
-#!/bin/sh
-# Master DHCP hotplug for all WireGuard interfaces
-# This script replaces per-interface DHCP hotplug scripts for efficiency
+# Deploy master DHCP hotplug script from lib/ (static file approach)
+# The script handles roaming between VPN interfaces
+SCRIPT_DIR=$(dirname "$0")
+MASTER_DHCP_SRC="${SCRIPT_DIR}/lib/wg-master-dhcp.sh"
 
-WG_REGISTRY="/tmp/wg_interface_registry"
-WG_MAC_STATE="/tmp/wg_mac_state"
-LOCK_FILE="/tmp/wg_dhcp_hotplug.lock"
-
-[ "$ACTION" = "add" ] || [ "$ACTION" = "new" ] || exit 0
-[ -f "$WG_REGISTRY" ] || exit 0
-
-# Acquire lock to prevent race conditions (BusyBox flock doesn't support -w)
-exec 200>"$LOCK_FILE"
-flock -x 200 || exit 1
-
-# === INJECTED COMMON LIBRARY ===
-COMMON_LIB_PLACEHOLDER
-
-# === CLEANUP FUNCTION FOR A SPECIFIC INTERFACE ===
-cleanup_client_from_interface() {
-    local iface="$1" mac="$2" rt="$3" ipv6_sup="$4"
-    local MARK_VALUE="$((0x10000 + rt))"
-    local IPV6_MARK_CHAIN="mark_ipv6_${iface}"
-    local BLOCK_CHAIN="${iface}_ipv6_block"
-    local BLOCK_IPV4_ONLY_CHAIN="${iface}_ipv4_only_block"
-    local BLOCK_IPV6_DNS_INPUT_CHAIN="${iface}_v6_dns_in"
-    
-    # Remove IPv4 routing rule using state file
-    local OLD_IP_FILE="/tmp/wg_ip_${iface}_${mac//:/}"
-    if [ -f "$OLD_IP_FILE" ]; then
-        local OLD_IP=$(cat "$OLD_IP_FILE")
-        ip rule del from "$OLD_IP" table $rt 2>/dev/null
-        rm -f "$OLD_IP_FILE"
-        logger -t wg-dhcp-master "[$iface] Removed IPv4 rule for $OLD_IP"
-    fi
-    
-    # Remove IPv6 fwmark (NAT66 mode) - loop to remove all duplicates
-    while ip6tables -t mangle -D $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE 2>/dev/null; do :; done
-    
-    # Remove IPv6 block rules (both old and new format) - loop to remove all duplicates
-    local lan_ifaces=$(get_lan_ifaces)
-    for lan_if in $lan_ifaces; do
-        while ip6tables -D $BLOCK_CHAIN -i $lan_if ! -o $iface -m mac --mac-source $mac -j DROP 2>/dev/null; do :; done
-        while ip6tables -D $BLOCK_CHAIN -i $lan_if -m mac --mac-source $mac -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null; do :; done
-    done
-    ip6tables -D $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP 2>/dev/null
-    ip6tables -D INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null
-    ip6tables -D INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP 2>/dev/null
-    while ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p udp --dport 53 -j REJECT 2>/dev/null; do :; done
-    while ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT 2>/dev/null; do :; done
-    
-    # Remove IPv6 routing rule using state file
-    local STATE_FILE="/tmp/wg_prefix_${iface}_${mac//:/}"
-    if [ -f "$STATE_FILE" ]; then
-        local OLD_RULE=$(cat "$STATE_FILE")
-        if [ -n "$OLD_RULE" ]; then
-            if echo "$OLD_RULE" | grep -q '/'; then
-                ip -6 rule del from "$OLD_RULE" table $rt 2>/dev/null
-            else
-                ip -6 rule del from "${OLD_RULE}::/64" table $rt 2>/dev/null
-            fi
-        fi
-        rm -f "$STATE_FILE"
-    fi
-    
-    # Flush route cache to apply changes immediately
-    ip -6 route flush cache 2>/dev/null
-    
-    logger -t wg-dhcp-master "[$iface] Cleaned up roaming client $mac"
-}
-
-# === FIND MATCHING INTERFACE ===
-MATCHED_IFACE=""
-while IFS='|' read -r iface rt vpn_ips ipv6_sup vpn_ip6_subs vpn_ip6_nat66; do
-    # Convert comma-separated VPN_IPS to space-separated for is_in_list
-    vpn_ips_spaced=$(echo "$vpn_ips" | tr ',' ' ')
-    if is_in_list "$IPADDR" "$vpn_ips_spaced"; then
-        MATCHED_IFACE="$iface"
-        MATCHED_RT="$rt"
-        MATCHED_VPN_IPS="$vpn_ips_spaced"
-        MATCHED_IPV6_SUP="$ipv6_sup"
-        MATCHED_VPN_IP6_SUBS="$vpn_ip6_subs"
-        MATCHED_VPN_IP6_NAT66="$vpn_ip6_nat66"
-        break
-    fi
-done < "$WG_REGISTRY"
-
-# === HANDLE ROAMING ===
-OLD_ENTRY=$(grep "^$MACADDR|" "$WG_MAC_STATE" 2>/dev/null)
-OLD_IFACE=$(echo "$OLD_ENTRY" | cut -d'|' -f2)
-OLD_RT=$(echo "$OLD_ENTRY" | cut -d'|' -f4)
-OLD_IPV6_SUP=$(echo "$OLD_ENTRY" | cut -d'|' -f5)
-
-if [ -n "$OLD_IFACE" ] && [ "$OLD_IFACE" != "$MATCHED_IFACE" ]; then
-    logger -t wg-dhcp-master "Client $MACADDR roaming: $OLD_IFACE -> ${MATCHED_IFACE:-direct}"
-    cleanup_client_from_interface "$OLD_IFACE" "$MACADDR" "$OLD_RT" "$OLD_IPV6_SUP"
-fi
-
-# === APPLY RULES FOR MATCHED INTERFACE ===
-if [ -n "$MATCHED_IFACE" ]; then
-    WG_INTERFACE="$MATCHED_IFACE"
-    ROUTING_TABLE="$MATCHED_RT"
-    VPN_IPS="$MATCHED_VPN_IPS"
-    IPV6_SUPPORTED="$MATCHED_IPV6_SUP"
-    VPN_IP6_SUBNETS="$MATCHED_VPN_IP6_SUBS"
-    VPN_IP6_NEEDS_NAT66="$MATCHED_VPN_IP6_NAT66"
-    KS_CHAIN="${WG_INTERFACE}_killswitch"
-    BLOCK_CHAIN="${WG_INTERFACE}_ipv6_block"
-    BLOCK_IPV6_DNS_INPUT_CHAIN="${WG_INTERFACE}_v6_dns_in"
-    BLOCK_IPV4_ONLY_CHAIN="${WG_INTERFACE}_ipv4_only_block"
-    
-    # Check if tunnel interface exists
-    if ifconfig | grep -q "$WG_INTERFACE"; then
-        logger -t wg-dhcp-master "[$WG_INTERFACE] New client $IPADDR ($MACADDR) detected. Applying VPN routing rules."
-        
-        # Ensure DNS blocking chain exists (defensive - in case ifup didn't create it)
-        ip6tables -N $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null
-        ip6tables -C INPUT -j $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null || ip6tables -I INPUT 1 -j $BLOCK_IPV6_DNS_INPUT_CHAIN
-        
-        iptables -D $KS_CHAIN -s $IPADDR -j REJECT 2>/dev/null
-        ip6tables -D $KS_CHAIN -m mac --mac-source $MACADDR -j REJECT 2>/dev/null
-        ip rule del from $IPADDR table $ROUTING_TABLE 2>/dev/null
-        ip rule add from $IPADDR table $ROUTING_TABLE priority $ROUTING_TABLE
-        echo "$IPADDR" > "/tmp/wg_ip_${WG_INTERFACE}_${MACADDR//:/}"
-
-        if [ "$IPV6_SUPPORTED" = "1" ]; then
-            # Universal MAC-based IPv6 marking (Roaming Support)
-            IPV6_MARK_CHAIN="mark_ipv6_${WG_INTERFACE}"
-            MARK_VALUE="$((0x10000 + ROUTING_TABLE))"
-            
-            # Ensure IPv6 marking chain exists (defensive - in case ifup didn't create it)
-            ip6tables -t mangle -N $IPV6_MARK_CHAIN 2>/dev/null
-            lan_ifaces=$(get_lan_ifaces)
-            for lan_if in $lan_ifaces; do
-                ip6tables -t mangle -C PREROUTING -i $lan_if -j $IPV6_MARK_CHAIN 2>/dev/null || \
-                    ip6tables -t mangle -A PREROUTING -i $lan_if -j $IPV6_MARK_CHAIN
-            done
-            
-            # Check if this MAC is already marked (idempotent)
-            if ! ip6tables -t mangle -C $IPV6_MARK_CHAIN -m mac --mac-source $MACADDR -j MARK --set-mark $MARK_VALUE 2>/dev/null; then
-                ip6tables -t mangle -A $IPV6_MARK_CHAIN -m mac --mac-source $MACADDR -j MARK --set-mark $MARK_VALUE
-                logger -t wg-dhcp-master "[$WG_INTERFACE] Added IPv6 fwmark for MAC $MACADDR (Universal roaming)"
-            fi
-            
-            # Ensure BLOCK_CHAIN exists and is linked to FORWARD (defensive)
-            ip6tables -N $BLOCK_CHAIN 2>/dev/null
-            ip6tables -C FORWARD -j $BLOCK_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $BLOCK_CHAIN
-            
-            # Ensure Leak Prevention (Block non-VPN traffic) is ACTIVE
-            lan_ifaces=$(get_lan_ifaces)
-            for lan_if in $lan_ifaces; do 
-                # Remove old rules (both formats for backward compatibility)
-                ip6tables -D $BLOCK_CHAIN -i $lan_if ! -o $WG_INTERFACE -m mac --mac-source $MACADDR -j DROP 2>/dev/null
-                ip6tables -D $BLOCK_CHAIN -i $lan_if -m mac --mac-source $MACADDR -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
-                # Add new rule: block unmarked traffic (allows fwmark-routed traffic through)
-                ip6tables -I $BLOCK_CHAIN 1 -i $lan_if -m mac --mac-source $MACADDR -m mark ! --mark $MARK_VALUE -j DROP
-            done
-            
-            # Proactive ping to populate neighbor table
-            (
-                ping -c 2 -W 1 "$IPADDR" >/dev/null 2>&1 &
-            ) &
-            
-            logger -t wg-dhcp-master "[$WG_INTERFACE] IPv6 routing active via fwmark for $MACADDR"
-        else
-            # IPv4-only tunnel: Block IPv6 for this client
-            logger -t wg-dhcp-master "[$WG_INTERFACE] Blocking IPv6 for $IPADDR ($MACADDR) on IPv4-only tunnel."
-            
-            # Ensure blocking chain exists (defensive)
-            ip6tables -N $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null
-            ip6tables -C FORWARD -j $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $BLOCK_IPV4_ONLY_CHAIN
-            
-            ip6tables -C $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $MACADDR -j DROP 2>/dev/null || \
-                ip6tables -A $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $MACADDR -j DROP
-            
-            # Block IPv6 acquisition (RS and DHCPv6)
-            ip6tables -C INPUT -m mac --mac-source $MACADDR -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null || \
-                ip6tables -A INPUT -m mac --mac-source $MACADDR -p icmpv6 --icmpv6-type 133 -j DROP
-            ip6tables -C INPUT -m mac --mac-source $MACADDR -p udp --dport 547 -j DROP 2>/dev/null || \
-                ip6tables -A INPUT -m mac --mac-source $MACADDR -p udp --dport 547 -j DROP
-        fi
-        
-        # Block IPv6 DNS to router for this client
-        ip6tables -C $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p udp --dport 53 -j REJECT 2>/dev/null || \
-            ip6tables -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p udp --dport 53 -j REJECT
-        ip6tables -C $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p tcp --dport 53 -j REJECT 2>/dev/null || \
-            ip6tables -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p tcp --dport 53 -j REJECT
-    else
-        # Tunnel is down - apply kill switch
-        logger -t wg-dhcp-master "[$WG_INTERFACE] New client $IPADDR ($MACADDR) detected, but tunnel is down. Applying kill switch."
-        iptables -N $KS_CHAIN 2>/dev/null; ip6tables -N $KS_CHAIN 2>/dev/null
-        iptables -C FORWARD -j $KS_CHAIN 2>/dev/null || iptables -I FORWARD 1 -j $KS_CHAIN
-        ip6tables -C FORWARD -j $KS_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $KS_CHAIN
-        iptables -A $KS_CHAIN -s $IPADDR -j REJECT --reject-with icmp-host-prohibited
-        ip6tables -A $KS_CHAIN -m mac --mac-source $MACADDR -j REJECT --reject-with icmp6-adm-prohibited
-    fi
-    
-    # Update MAC state
-    sed -i "/^$MACADDR|/d" "$WG_MAC_STATE" 2>/dev/null
-    echo "$MACADDR|$WG_INTERFACE|$IPADDR|$ROUTING_TABLE|$IPV6_SUPPORTED" >> "$WG_MAC_STATE"
+if [ -f "$MASTER_DHCP_SRC" ]; then
+    echo "Deploying master DHCP hotplug script: $MASTER_DHCP_HOTPLUG"
+    cp "$MASTER_DHCP_SRC" "$MASTER_DHCP_HOTPLUG"
+    chmod +x "$MASTER_DHCP_HOTPLUG"
 else
-    # Client is NOT in any VPN list - cleanup was already done above if roaming
-    # Also do fallback cleanup just in case
-    if [ -z "$OLD_IFACE" ]; then
-        # No previous state - check all interfaces for stale rules
-        while IFS='|' read -r iface rt vpn_ips ipv6_sup vpn_ip6_subs vpn_ip6_nat66; do
-            # Quick cleanup attempt for each interface
-            ip rule del from "$IPADDR" table $rt 2>/dev/null
-        done < "$WG_REGISTRY"
-    fi
-    sed -i "/^$MACADDR|/d" "$WG_MAC_STATE" 2>/dev/null
+    echo "Error: Master DHCP hotplug source not found at $MASTER_DHCP_SRC"
+    exit 1
 fi
-
-ip route flush cache
-flock -u 200
-EOF_MASTER_DHCP
-
-# Inject the common library content into master DHCP hotplug
-inject_common_lib "$MASTER_DHCP_HOTPLUG"
-
-chmod +x "$MASTER_DHCP_HOTPLUG"
 
 # Create cleanup script
 cat > /etc/hotplug.d/iface/99-${INTERFACE_NAME}-cleanup << 'EOFCLEANUP'
