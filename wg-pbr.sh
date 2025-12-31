@@ -685,6 +685,19 @@ handle_client_ipv6() {
     ip6tables -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac_addr -p tcp --dport 53 -j REJECT
 }
 
+block_doh_domains() {
+    local ipt_cmd="$1"  # 'iptables' or 'ip6tables'
+    local chain="$2"
+    local src="$3"      # optional: '-s <ip>' for IPv4, empty for IPv6 broad block
+    
+    [ -f /etc/config/https-dns-proxy ] || return 0
+    
+    local domains=$(grep 'resolver_url' /etc/config/https-dns-proxy | awk -F'/' '{print $3}')
+    for domain in $domains; do
+        $ipt_cmd -A $chain $src -p tcp --dport 443 -m string --algo bm --string "$domain" -j REJECT --reject-with tcp-reset
+    done
+}
+
 setup_secure_dns() {
     local vpn_dns_list="$1"
     local vpn_ips="$2"
@@ -784,16 +797,7 @@ setup_secure_dns() {
             iptables -A $filter_chain -s $item -p udp --dport 853 -j REJECT --reject-with icmp-port-unreachable
 
             # Dynamically block DoH providers by reading the https-dns-proxy config
-            if [ -f /etc/config/https-dns-proxy ]; then
-                DOH_DOMAINS=$(grep 'resolver_url' /etc/config/https-dns-proxy | awk -F'/' '{print $3}')
-            fi
-
-            # Add any other domains to block
-            DOH_DOMAINS="$DOH_DOMAINS dns.quad9.net"
-
-            for domain in $DOH_DOMAINS; do
-                iptables -A $filter_chain -s $item -p tcp --dport 443 -m string --algo bm --string "$domain" -j REJECT --reject-with tcp-reset
-            done
+            block_doh_domains iptables $filter_chain "-s $item"
 
             # Block access to local dnsmasq (INPUT)
             iptables -A $input_block_chain -s $item -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable
@@ -841,9 +845,8 @@ setup_secure_dns() {
         # Block DoT/DoH (IPv6) - apply broadly
         ip6tables -A $filter_chain_v6 -p tcp --dport 853 -j REJECT --reject-with tcp-reset
         ip6tables -A $filter_chain_v6 -p udp --dport 853 -j REJECT --reject-with icmp6-port-unreachable
-        ip6tables -A $filter_chain_v6 -p tcp --dport 443 -m string --algo bm --string "dns.google" -j REJECT --reject-with tcp-reset
-        ip6tables -A $filter_chain_v6 -p tcp --dport 443 -m string --algo bm --string "cloudflare-dns.com" -j REJECT --reject-with tcp-reset
-        ip6tables -A $filter_chain_v6 -p tcp --dport 443 -m string --algo bm --string "dns.quad9.net" -j REJECT --reject-with tcp-reset
+        # Dynamically block DoH providers by reading the https-dns-proxy config
+        block_doh_domains ip6tables $filter_chain_v6
 
         ip6tables -t nat -I PREROUTING 1 -j $nat_chain_v6
         ip6tables -I FORWARD 1 -j $filter_chain_v6
