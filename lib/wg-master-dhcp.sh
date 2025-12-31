@@ -6,7 +6,7 @@ WG_REGISTRY="/tmp/wg_interface_registry"
 WG_MAC_STATE="/tmp/wg_mac_state"
 LOCK_FILE="/tmp/wg_dhcp_hotplug.lock"
 
-[ "$ACTION" = "add" ] || [ "$ACTION" = "new" ] || exit 0
+[ "$ACTION" = "add" ] || [ "$ACTION" = "new" ] || [ "$ACTION" = "old" ] || exit 0
 [ -f "$WG_REGISTRY" ] || exit 0
 
 # Acquire lock to prevent race conditions (BusyBox flock doesn't support -w)
