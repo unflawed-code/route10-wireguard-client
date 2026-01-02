@@ -1,37 +1,18 @@
 #!/bin/ash
 
 CONF_DIR="/path/to/conf"
-WG_IPS_SCRIPT="/path/to/wg-pbr.sh"
+WG_SCRIPT="/path/to/wg-pbr.sh"
 
-# (
-    # --- Helper Function ---
-    # Defines a function to configure an interface
-    # Usage: setup_interface <iface_name> <routing_table> <target_ips_list>
-    setup_interface() {
-        local iface="$1"
-        local routing_table="$2"
-        local target_ips="$3"
-        
-        echo "Setting up $iface..."
-        $WG_IPS_SCRIPT "$iface" \
-            -c "$CONF_DIR/$iface.conf" \
-            -r "$routing_table" \
-            -t "$target_ips"
-    }
+# --- WireGuard Interface Configuration ---
+# Usage: $WG_SCRIPT <interface_name> -c <config_file> [-r <routing_table>] -t '<target_ips>'
+# Note: -r is optional; if omitted, a routing table will be auto-allocated
 
-    # --- Interface Configuration ---
-    # Add or remove lines here to manage interfaces
-    # Arguments: interface_name, routing_table, "target_ips"
-    
-    # setup_interface "interface_name" "routing_table" "target_ips"
+# $WG_SCRIPT wgexample -c "$CONF_DIR/wgexample.conf" -t '10.0.0.0/24'
+# $WG_SCRIPT wgexample2 -c "$CONF_DIR/wgexample2.conf" -r 100 -t '10.0.1.0/24,10.0.1.5'
 
-    # --- End of Interface Configuration ---
+# --- End of WireGuard Configuration ---
 
-    # echo "Committing configuration..."
-    $WG_IPS_SCRIPT commit
-
-    # echo "Reapplying firewall rules..."
-    $WG_IPS_SCRIPT reapply
-# ) > /tmp/post-cfg.log 2>&1
+$WG_SCRIPT commit
+$WG_SCRIPT reapply
 
 exit 0
