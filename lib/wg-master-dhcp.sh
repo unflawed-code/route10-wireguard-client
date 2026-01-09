@@ -2,12 +2,14 @@
 # Master DHCP hotplug for all WireGuard interfaces
 # This script replaces per-interface DHCP hotplug scripts for efficiency
 
-WG_REGISTRY="/tmp/wg_interface_registry"
-WG_MAC_STATE="/tmp/wg_mac_state"
-LOCK_FILE="/tmp/wg_dhcp_hotplug.lock"
+WG_TMP_DIR="/tmp/wg-custom"
+mkdir -p "$WG_TMP_DIR" 2>/dev/null || true
+WG_DB_PATH="${WG_TMP_DIR}/wg_pbr.db"
+WG_MAC_STATE="${WG_TMP_DIR}/mac_state"
+LOCK_FILE="${WG_TMP_DIR}/dhcp_hotplug.lock"
 
 [ "$ACTION" = "add" ] || [ "$ACTION" = "new" ] || [ "$ACTION" = "old" ] || exit 0
-[ -f "$WG_REGISTRY" ] || exit 0
+[ -f "$WG_DB_PATH" ] || exit 0
 
 # Acquire lock to prevent race conditions (BusyBox flock doesn't support -w)
 exec 200>"$LOCK_FILE"
@@ -143,16 +145,18 @@ discover_mac_for_ip() {
 
 # Clean up old routing rules when reconfiguring an existing WireGuard interface
 # This is essential for proper roaming and reconfiguration
-# Usage: cleanup_interface_rules "wg0" "/tmp/wg_interface_registry"
+# Usage: cleanup_interface_rules "wg0"
 cleanup_interface_rules() {
     local INTERFACE_NAME="$1"
-    local WG_REGISTRY="$2"
-    local WG_MAC_STATE="/tmp/wg_mac_state"
+    local WG_MAC_STATE="${WG_TMP_DIR}/mac_state"
     
-    [ -z "$INTERFACE_NAME" ] || [ -z "$WG_REGISTRY" ] && return 0
-    [ ! -f "$WG_REGISTRY" ] && return 0
+    [ -z "$INTERFACE_NAME" ] && return 0
     
-    local OLD_ENTRY=$(grep "^${INTERFACE_NAME}|" "$WG_REGISTRY" 2>/dev/null)
+    # Get interface data from SQLite
+    local OLD_ENTRY=""
+    if [ -f "$WG_DB_PATH" ]; then
+        OLD_ENTRY=$(sqlite3 -separator '|' "$WG_DB_PATH" "SELECT name, routing_table, target_ips FROM interfaces WHERE name = '$INTERFACE_NAME';" 2>/dev/null)
+    fi
     [ -z "$OLD_ENTRY" ] && return 0
     
     echo "Found existing registry entry for $INTERFACE_NAME, cleaning up old rules..."
@@ -187,19 +191,17 @@ cleanup_interface_rules() {
     echo "  Flushing ip6tables mangle chain: $IPV6_MARK_CHAIN"
     ip6tables -t mangle -F "$IPV6_MARK_CHAIN" 2>/dev/null || true
     
-    # Clean up MAC state entries for this interface
-    if [ -f "$WG_MAC_STATE" ]; then
-        echo "  Removing MAC state entries for $INTERFACE_NAME"
-        local MACS=$(grep "|${INTERFACE_NAME}|" "$WG_MAC_STATE" 2>/dev/null | cut -d'|' -f1)
-        
-        for mac in $MACS; do
-            local mac_clean="${mac//:/}"
-            rm -f "/tmp/wg_prefix_${INTERFACE_NAME}_${mac_clean}" 2>/dev/null
-            rm -f "/tmp/wg_ip_${INTERFACE_NAME}_${mac_clean}" 2>/dev/null
-        done
-        
-        sed -i "/|${INTERFACE_NAME}|/d" "$WG_MAC_STATE" 2>/dev/null || true
-    fi
+    # Clean up MAC state entries for this interface (from SQLite)
+    echo "  Removing MAC state entries for $INTERFACE_NAME"
+    local MACS=$(sqlite3 "$WG_DB_PATH" "SELECT mac FROM mac_state WHERE interface = '$INTERFACE_NAME';" 2>/dev/null)
+    
+    for mac in $MACS; do
+        local mac_clean="${mac//:/}"
+        rm -f "${WG_TMP_DIR}/prefix_${INTERFACE_NAME}_${mac_clean}" 2>/dev/null
+        rm -f "${WG_TMP_DIR}/ip_${INTERFACE_NAME}_${mac_clean}" 2>/dev/null
+    done
+    
+    sqlite3 "$WG_DB_PATH" "DELETE FROM mac_state WHERE interface = '$INTERFACE_NAME';" 2>/dev/null || true
     
     echo "  Old rules cleaned up."
 }
@@ -214,7 +216,7 @@ cleanup_client_from_interface() {
     local BLOCK_IPV6_DNS_INPUT_CHAIN="${iface}_v6_dns_in"
     
     # Remove IPv4 routing rule using state file
-    local OLD_IP_FILE="/tmp/wg_ip_${iface}_${mac//:/}"
+    local OLD_IP_FILE="${WG_TMP_DIR}/ip_${iface}_${mac//:/}"
     if [ -f "$OLD_IP_FILE" ]; then
         local OLD_IP=$(cat "$OLD_IP_FILE")
         ip rule del from "$OLD_IP" table $rt 2>/dev/null
@@ -239,7 +241,7 @@ cleanup_client_from_interface() {
     while ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT 2>/dev/null; do :; done
     
     # Remove IPv6 routing rule using state file
-    local STATE_FILE="/tmp/wg_prefix_${iface}_${mac//:/}"
+    local STATE_FILE="${WG_TMP_DIR}/prefix_${iface}_${mac//:/}"
     if [ -f "$STATE_FILE" ]; then
         local OLD_RULE=$(cat "$STATE_FILE")
         if [ -n "$OLD_RULE" ]; then
@@ -260,22 +262,26 @@ cleanup_client_from_interface() {
 
 # === FIND MATCHING INTERFACE ===
 MATCHED_IFACE=""
+# Query all committed interfaces from SQLite
+sqlite3 -separator '|' "$WG_DB_PATH" "SELECT name, routing_table, target_ips, COALESCE(ipv6_support,0), COALESCE(ipv6_subnets,''), COALESCE(nat66,0) FROM interfaces WHERE committed = 1;" 2>/dev/null | \
 while IFS='|' read -r iface rt vpn_ips ipv6_sup vpn_ip6_subs vpn_ip6_nat66; do
     # Convert comma-separated VPN_IPS to space-separated for is_in_list
     vpn_ips_spaced=$(echo "$vpn_ips" | tr ',' ' ')
     if is_in_list "$IPADDR" "$vpn_ips_spaced"; then
-        MATCHED_IFACE="$iface"
-        MATCHED_RT="$rt"
-        MATCHED_VPN_IPS="$vpn_ips_spaced"
-        MATCHED_IPV6_SUP="$ipv6_sup"
-        MATCHED_VPN_IP6_SUBS="$vpn_ip6_subs"
-        MATCHED_VPN_IP6_NAT66="$vpn_ip6_nat66"
+        # Write match to temp file (subshell can't export)
+        echo "$iface|$rt|$vpn_ips_spaced|$ipv6_sup|$vpn_ip6_subs|$vpn_ip6_nat66" > "${WG_TMP_DIR}/dhcp_match_$$"
         break
     fi
-done < "$WG_REGISTRY"
+done
+
+# Read match from temp file
+if [ -f "${WG_TMP_DIR}/dhcp_match_$$" ]; then
+    IFS='|' read -r MATCHED_IFACE MATCHED_RT MATCHED_VPN_IPS MATCHED_IPV6_SUP MATCHED_VPN_IP6_SUBS MATCHED_VPN_IP6_NAT66 < "${WG_TMP_DIR}/dhcp_match_$$"
+    rm -f "${WG_TMP_DIR}/dhcp_match_$$"
+fi
 
 # === HANDLE ROAMING ===
-OLD_ENTRY=$(grep "^$MACADDR|" "$WG_MAC_STATE" 2>/dev/null)
+OLD_ENTRY=$(sqlite3 -separator '|' "$WG_DB_PATH" "SELECT * FROM mac_state WHERE mac = '$MACADDR';" 2>/dev/null)
 OLD_IFACE=$(echo "$OLD_ENTRY" | cut -d'|' -f2)
 OLD_RT=$(echo "$OLD_ENTRY" | cut -d'|' -f4)
 OLD_IPV6_SUP=$(echo "$OLD_ENTRY" | cut -d'|' -f5)
@@ -310,7 +316,7 @@ if [ -n "$MATCHED_IFACE" ]; then
         ip6tables -D $KS_CHAIN -m mac --mac-source $MACADDR -j REJECT 2>/dev/null
         ip rule del from $IPADDR table $ROUTING_TABLE 2>/dev/null
         ip rule add from $IPADDR table $ROUTING_TABLE priority $ROUTING_TABLE
-        echo "$IPADDR" > "/tmp/wg_ip_${WG_INTERFACE}_${MACADDR//:/}"
+        echo "$IPADDR" > "${WG_TMP_DIR}/ip_${WG_INTERFACE}_${MACADDR//:/}"
 
         if [ "$IPV6_SUPPORTED" = "1" ]; then
             # Universal MAC-based IPv6 marking (Roaming Support)
@@ -384,20 +390,20 @@ if [ -n "$MATCHED_IFACE" ]; then
         ip6tables -A $KS_CHAIN -m mac --mac-source $MACADDR -j REJECT --reject-with icmp6-adm-prohibited
     fi
     
-    # Update MAC state
-    sed -i "/^$MACADDR|/d" "$WG_MAC_STATE" 2>/dev/null
-    echo "$MACADDR|$WG_INTERFACE|$IPADDR|$ROUTING_TABLE|$IPV6_SUPPORTED" >> "$WG_MAC_STATE"
+    # Update MAC state in SQLite
+    sqlite3 "$WG_DB_PATH" "DELETE FROM mac_state WHERE mac = '$MACADDR';" 2>/dev/null
+    sqlite3 "$WG_DB_PATH" "INSERT INTO mac_state (mac, interface, ip, routing_table, ipv6_support) VALUES ('$MACADDR', '$WG_INTERFACE', '$IPADDR', $ROUTING_TABLE, $IPV6_SUPPORTED);"
 else
     # Client is NOT in any VPN list - cleanup was already done above if roaming
     # Also do fallback cleanup just in case
     if [ -z "$OLD_IFACE" ]; then
         # No previous state - check all interfaces for stale rules
-        while IFS='|' read -r iface rt vpn_ips ipv6_sup vpn_ip6_subs vpn_ip6_nat66; do
+        for rt in $(sqlite3 "$WG_DB_PATH" "SELECT routing_table FROM interfaces WHERE committed = 1;" 2>/dev/null); do
             # Quick cleanup attempt for each interface
             ip rule del from "$IPADDR" table $rt 2>/dev/null
-        done < "$WG_REGISTRY"
+        done
     fi
-    sed -i "/^$MACADDR|/d" "$WG_MAC_STATE" 2>/dev/null
+    sqlite3 "$WG_DB_PATH" "DELETE FROM mac_state WHERE mac = '$MACADDR';" 2>/dev/null
 fi
 
 ip route flush cache

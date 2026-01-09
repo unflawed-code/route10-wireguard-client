@@ -6,7 +6,16 @@ Plugins extend `wg-pbr.sh` by hooking into specific execution points. Each plugi
 
 ## Available Hooks
 
-Hooks are called in the following order:
+### Command Handlers (run before workflow)
+
+| Hook | When Called | Arguments |
+| ------ | ------------- | ----------- |
+| `show_plugin_help` | When usage/help is displayed | (none) |
+| `handle_command` | Before arg parsing | `$@`: all CLI arguments |
+
+> **Note**: `handle_command` should return 0 if the command was handled (wg-pbr.sh will exit), or 1 to continue normal argument parsing.
+
+### Workflow Hooks (in execution order)
 
 | # | Hook | When Called | Arguments |
 | --- | ------ | ------------- | ----------- |

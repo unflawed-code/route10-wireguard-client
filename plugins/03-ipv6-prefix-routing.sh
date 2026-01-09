@@ -19,8 +19,30 @@ process_ipv6_prefix() {
     
     # Handle /64 and larger subnets
     if [ "$prefix_len" -le 64 ]; then
-        # Extract first 4 blocks for /64 and larger
-        network_prefix=$(echo "$addr_part" | cut -d: -f1-4)
+        # Expand compressed IPv6 address to full 8 groups, then extract needed groups
+        # For /64 and larger, we need the first 4 groups (first 64 bits)
+        network_prefix=$(echo "$addr_part" | awk -F: '{
+            # Count existing groups (non-empty)
+            n = 0
+            for (i=1; i<=NF; i++) if ($i != "") n++
+            # Calculate how many zeros to insert for ::
+            missing = 8 - n
+            # Build expanded address
+            out = ""
+            for (i=1; i<=NF; i++) {
+                if ($i == "" && missing > 0) {
+                    # This is :: expansion point
+                    for (j=0; j<missing; j++) out = out "0:"
+                    missing = 0
+                } else if ($i != "") {
+                    out = out $i ":"
+                }
+            }
+            # Remove trailing colon and print first 4 groups
+            gsub(/:$/, "", out)
+            split(out, groups, ":")
+            printf "%s:%s:%s:%s", groups[1], groups[2], groups[3], groups[4]
+        }')
         subnet="${network_prefix}::/${prefix_len}"
         
         # Check if this subnet was already added (prevent duplicates)

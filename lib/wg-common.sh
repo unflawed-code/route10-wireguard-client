@@ -132,16 +132,20 @@ discover_mac_for_ip() {
 
 # Clean up old routing rules when reconfiguring an existing WireGuard interface
 # This is essential for proper roaming and reconfiguration
-# Usage: cleanup_interface_rules "wg0" "/tmp/wg_interface_registry"
+# Usage: cleanup_interface_rules "wg0"
 cleanup_interface_rules() {
     local INTERFACE_NAME="$1"
-    local WG_REGISTRY="$2"
-    local WG_MAC_STATE="/tmp/wg_mac_state"
+    local WG_TMP_DIR="/tmp/wg-custom"
+    local WG_DB_PATH="${WG_TMP_DIR}/wg_pbr.db"
+    local WG_MAC_STATE="${WG_TMP_DIR}/mac_state"
     
-    [ -z "$INTERFACE_NAME" ] || [ -z "$WG_REGISTRY" ] && return 0
-    [ ! -f "$WG_REGISTRY" ] && return 0
+    [ -z "$INTERFACE_NAME" ] && return 0
     
-    local OLD_ENTRY=$(grep "^${INTERFACE_NAME}|" "$WG_REGISTRY" 2>/dev/null)
+    # Get interface data from SQLite
+    local OLD_ENTRY=""
+    if [ -f "$WG_DB_PATH" ]; then
+        OLD_ENTRY=$(sqlite3 -separator '|' "$WG_DB_PATH" "SELECT name, routing_table, target_ips FROM interfaces WHERE name = '$INTERFACE_NAME';" 2>/dev/null)
+    fi
     [ -z "$OLD_ENTRY" ] && return 0
     
     echo "Found existing registry entry for $INTERFACE_NAME, cleaning up old rules..."
@@ -176,19 +180,235 @@ cleanup_interface_rules() {
     echo "  Flushing ip6tables mangle chain: $IPV6_MARK_CHAIN"
     ip6tables -t mangle -F "$IPV6_MARK_CHAIN" 2>/dev/null || true
     
-    # Clean up MAC state entries for this interface
-    if [ -f "$WG_MAC_STATE" ]; then
-        echo "  Removing MAC state entries for $INTERFACE_NAME"
-        local MACS=$(grep "|${INTERFACE_NAME}|" "$WG_MAC_STATE" 2>/dev/null | cut -d'|' -f1)
-        
-        for mac in $MACS; do
-            local mac_clean="${mac//:/}"
-            rm -f "/tmp/wg_prefix_${INTERFACE_NAME}_${mac_clean}" 2>/dev/null
-            rm -f "/tmp/wg_ip_${INTERFACE_NAME}_${mac_clean}" 2>/dev/null
-        done
-        
-        sed -i "/|${INTERFACE_NAME}|/d" "$WG_MAC_STATE" 2>/dev/null || true
-    fi
+    # Clean up MAC state entries for this interface (from SQLite)
+    echo "  Removing MAC state entries for $INTERFACE_NAME"
+    local MACS=$(sqlite3 "$WG_DB_PATH" "SELECT mac FROM mac_state WHERE interface = '$INTERFACE_NAME';" 2>/dev/null)
+    
+    for mac in $MACS; do
+        local mac_clean="${mac//:/}"
+        rm -f "${WG_TMP_DIR}/prefix_${INTERFACE_NAME}_${mac_clean}" 2>/dev/null
+        rm -f "${WG_TMP_DIR}/ip_${INTERFACE_NAME}_${mac_clean}" 2>/dev/null
+    done
+    
+    sqlite3 "$WG_DB_PATH" "DELETE FROM mac_state WHERE interface = '$INTERFACE_NAME';" 2>/dev/null || true
     
     echo "  Old rules cleaned up."
+}
+
+# === IP REMOVAL CLEANUP ===
+
+# Clean up MAC state and firewall rules for a specific IP being removed from an interface
+# This is called during hot-reload when an IP is moved to another interface
+# Usage: cleanup_mac_for_ip <interface> <removed_ip>
+cleanup_mac_for_ip() {
+    local iface="$1"
+    local removed_ip="$2"
+    local WG_TMP_DIR="/tmp/wg-custom"
+    local WG_DB_PATH="${WG_TMP_DIR}/wg_pbr.db"
+    
+    [ ! -f "$WG_DB_PATH" ] && return 0
+    
+    # Find MAC address for this IP from SQLite
+    local mac_entry=$(sqlite3 -separator '|' "$WG_DB_PATH" "SELECT * FROM mac_state WHERE interface = '$iface' AND ip = '$removed_ip';" 2>/dev/null)
+    [ -z "$mac_entry" ] && return 0
+    
+    local mac=$(echo "$mac_entry" | cut -d'|' -f1)
+    local rt=$(echo "$mac_entry" | cut -d'|' -f4)
+    local ipv6_sup=$(echo "$mac_entry" | cut -d'|' -f5)
+    
+    [ -z "$mac" ] && return 0
+    
+    # Validate rt is a number (may be empty or invalid for malformed entries)
+    [ -z "$rt" ] && return 0
+    case "$rt" in
+        ''|*[!0-9]*) return 0 ;;  # Not a valid number, skip
+    esac
+    
+    # Clean up firewall rules for this client
+    local MARK_VALUE="$((0x10000 + rt))"
+    local IPV6_MARK_CHAIN="mark_ipv6_${iface}"
+    local BLOCK_CHAIN="${iface}_ipv6_block"
+    local BLOCK_IPV4_ONLY_CHAIN="${iface}_ipv4_only_block"
+    local BLOCK_IPV6_DNS_INPUT_CHAIN="${iface}_v6_dns_in"
+    
+    # Remove IPv6 fwmark rule
+    ip6tables -t mangle -D $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
+    
+    # Remove IPv6 block rules
+    local lan_ifaces=$(get_lan_ifaces)
+    for lan_if in $lan_ifaces; do
+        ip6tables -D $BLOCK_CHAIN -i $lan_if -m mac --mac-source $mac -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null || true
+    done
+    
+    # Remove IPv4-only block rules
+    ip6tables -D $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP 2>/dev/null || true
+    ip6tables -D INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null || true
+    ip6tables -D INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP 2>/dev/null || true
+    
+    # Remove IPv6 DNS block rules
+    ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p udp --dport 53 -j REJECT 2>/dev/null || true
+    ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT 2>/dev/null || true
+    
+    # Remove MAC state entry from SQLite
+    sqlite3 "$WG_DB_PATH" "DELETE FROM mac_state WHERE interface = '$iface' AND mac = '$mac';" 2>/dev/null || true
+    
+    # Clean up state files
+    local mac_clean="${mac//:/}"
+    rm -f "${WG_TMP_DIR}/ip_${iface}_${mac_clean}" 2>/dev/null
+    rm -f "${WG_TMP_DIR}/prefix_${iface}_${mac_clean}" 2>/dev/null
+    
+    echo "  Cleaned up MAC state for $mac (IP: $removed_ip)"
+}
+
+# === HOT-RELOAD UTILITIES ===
+
+# Hot-reload: Update ipset with new target IPs without restarting interface
+# Also updates ip rules to ensure routing changes immediately
+# Triggers DHCP re-processing for moved IPs to update DNS/IPv6 rules
+# Usage: update_ipset_targets <interface> <new-ips> [old-ips]
+# Note: Appends to DEFERRED_DHCP_IPS global variable for deferred processing
+update_ipset_targets() {
+    local iface="$1"
+    local new_ips="$2"
+    local old_ips="${3:-}"  # Optional - if not provided, read from ipset
+    local WG_TMP_DIR="/tmp/wg-custom"
+    local MASTER_DHCP_HOTPLUG="/etc/hotplug.d/dhcp/99-wg-master-pbr"
+    
+    local ipset_name="vpn_${iface}"
+    local ipset_v6="vpn6_${iface}"
+    local rt_name="${iface}_rt"
+    
+    # If old_ips not provided, read current config from ipset (source of truth)
+    if [ -z "$old_ips" ]; then
+        old_ips=$(ipset list "$ipset_name" 2>/dev/null | grep -E '^[0-9]' | tr '\n' ' ')
+    else
+        # Convert old_ips to space-separated if comma-separated
+        old_ips=$(echo "$old_ips" | tr ',' ' ')
+    fi
+    
+    # Track IPs that need DHCP re-processing
+    local ips_to_reprocess=""
+    
+    # Remove old ip rules for IPs that are no longer in this interface
+    for old_ip in $old_ips; do
+        # Check if this IP is still in new list
+        local still_exists=0
+        for new_ip in $(echo "$new_ips" | tr ',' ' '); do
+            [ "$old_ip" = "$new_ip" ] && still_exists=1 && break
+        done
+        if [ "$still_exists" = "0" ]; then
+            # Remove ip rule for this IP
+            ip rule del from "$old_ip" lookup "$rt_name" 2>/dev/null && \
+                echo "  Removed ip rule: from $old_ip lookup $rt_name"
+            
+            # Remove DNS DNAT rules for this IP (prevents DNAT conflicts when IP moves to another interface)
+            # Must use loop since iptables -D requires exact match including --to-destination
+            local dns_nat_chain="vpn_dns_nat_${iface}"
+            while iptables -t nat -L "$dns_nat_chain" --line-numbers -n 2>/dev/null | grep -q "^[0-9].*${old_ip}"; do
+                local line_num=$(iptables -t nat -L "$dns_nat_chain" --line-numbers -n 2>/dev/null | grep "^[0-9].*${old_ip}" | head -1 | awk '{print $1}')
+                [ -n "$line_num" ] && iptables -t nat -D "$dns_nat_chain" "$line_num" && echo "  Removed DNS DNAT rule $line_num for $old_ip"
+            done
+            
+            # Clean up MAC state and IPv6 firewall rules for this IP
+            cleanup_mac_for_ip "$iface" "$old_ip"
+        fi
+    done
+    
+    # Add new ip rules for IPs that need them
+    if [ "$new_ips" != "none" ]; then
+        for new_ip in $(echo "$new_ips" | tr ',' ' '); do
+            # Skip IPv6
+            case "$new_ip" in
+                *:*) continue ;;
+            esac
+            
+            # Check if ip rule already exists (more reliable than old_ips comparison)
+            if ! ip rule show | grep -q "from $new_ip lookup $rt_name"; then
+                ip rule add from "$new_ip" lookup "$rt_name" 2>/dev/null && \
+                    echo "  Added ip rule: from $new_ip lookup $rt_name"
+                # Mark for DHCP re-processing (DNS/IPv6 rules)
+                ips_to_reprocess="$ips_to_reprocess $new_ip"
+            fi
+        done
+    fi
+    
+    # Flush and repopulate ipsets
+    ipset flush "$ipset_name" 2>/dev/null || true
+    ipset flush "$ipset_v6" 2>/dev/null || true
+    
+    if [ "$new_ips" != "none" ]; then
+        for ip in $(echo "$new_ips" | tr ',' ' '); do
+            case "$ip" in
+                *:*) ipset add "$ipset_v6" "$ip" 2>/dev/null ;;
+                *)   ipset add "$ipset_name" "$ip" 2>/dev/null ;;
+            esac
+        done
+    fi
+    
+    # Update DNS DNAT rules for moved IPs
+    local dns_nat_chain="vpn_dns_nat_${iface}"
+    
+    # Ensure DNS NAT chain is hooked into PREROUTING
+    if iptables -t nat -L "$dns_nat_chain" -n >/dev/null 2>&1; then
+        iptables -t nat -C PREROUTING -j "$dns_nat_chain" 2>/dev/null || \
+            iptables -t nat -I PREROUTING 1 -j "$dns_nat_chain"
+    fi
+    
+    # Get DNS server from existing rules in this chain
+    local dns_server=$(iptables -t nat -L "$dns_nat_chain" -n 2>/dev/null | \
+        grep -oE 'to:[0-9.]+' | head -1 | cut -d: -f2)
+    
+    if [ -n "$dns_server" ]; then
+        # Ensure DNS DNAT exists for ALL single IPs (not just new ones)
+        # This handles the case where an IP is moved back to a previous interface
+        if [ "$new_ips" != "none" ]; then
+            for ip in $(echo "$new_ips" | tr ',' ' '); do
+                # Add for single IPs and subnets (skip IPv6)
+                case "$ip" in
+                    *:*) ;; # Skip IPv6
+                    *)
+                        # Check if rule already exists
+                        if ! iptables -t nat -C "$dns_nat_chain" -s "$ip" -p udp --dport 53 -j DNAT --to-destination "$dns_server" 2>/dev/null; then
+                            iptables -t nat -A "$dns_nat_chain" -s "$ip" -p udp --dport 53 -j DNAT --to-destination "$dns_server"
+                            iptables -t nat -A "$dns_nat_chain" -s "$ip" -p tcp --dport 53 -j DNAT --to-destination "$dns_server"
+                            echo "  Added DNS DNAT: $ip -> $dns_server"
+                        fi
+                        ;;
+                esac
+            done
+        fi
+    fi
+    
+    # Trigger DHCP re-processing for ALL single IPs to ensure IPv6 rules are set up
+    # This is essential when IPs move between IPv6-enabled and IPv4-only interfaces
+    if [ "$new_ips" != "none" ]; then
+        for ip in $(echo "$new_ips" | tr ',' ' '); do
+            case "$ip" in
+                */*) ;; # Skip subnets
+                *:*) ;; # Skip IPv6
+                *)
+                    # Write to temp file (survives subshell in commit loop)
+                    echo "$ip" >> "${WG_TMP_DIR}/deferred_dhcp.tmp"
+                    ;;
+            esac
+        done
+    fi
+    
+    echo "Updated ipset for $iface: $new_ips"
+}
+
+# Hot-reload: Update registry with new target IPs (SQLite only)
+# Usage: update_registry_targets <interface> <comma-separated-ips>
+update_registry_targets() {
+    local iface="$1"
+    local new_ips="$2"
+    local WG_TMP_DIR="/tmp/wg-custom"
+    local WG_DB_PATH="${WG_TMP_DIR}/wg_pbr.db"
+    
+    [ ! -f "$WG_DB_PATH" ] && return 1
+    
+    # Update target_ips in SQLite
+    sqlite3 "$WG_DB_PATH" "UPDATE interfaces SET target_ips = '$new_ips' WHERE name = '$iface';"
+    
+    echo "Updated registry for $iface"
 }

@@ -7,8 +7,14 @@
 # Keep markdown and text files with LF
 *.md text eol=lf
 *.txt text eol=lf
+*.conf text eol=lf
 
 # Binary files (no line ending conversion)
 *.png binary
 *.jpg binary
 *.gif binary
+
+# Exclude from release archives (git archive / GitHub releases)
+/tests export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore

@@ -37,16 +37,22 @@ Tested on Route10 firmware version `1.4o`.
 3. **Run the Script**:
 
     ```sh
-    Usage: ./wg-pbr.sh <interface_name> -c <config_file> -t <IPs_comma_separated> [-r <routing_table>]
+    Usage: ./wg-pbr.sh <interface_name> -c <config_file> [-t <IPs_comma_separated>] [-r <routing_table>]
       Arguments for configuration:
         <interface_name>:   WireGuard interface name (max 11 chars)
         -c, --conf <file>:      Relative or absolute path to the wg conf file
-        -t, --target-ips <IPs>:  Comma-separated list of IPv4 addresses or subnets
+        -t, --target-ips <IPs>:  (Optional) Comma-separated list of IPv4 addresses/subnets
         -r, --routing-table <N>: (Optional) Routing table number, auto-allocated 100-199 if not provided
 
     Commands:
       ./wg-pbr.sh commit               Apply all staged WireGuard interface configurations.
-      ./wg-pbr.sh reapply              (Optional) Re-apply firewall rules for all registered interfaces (useful after boot).
+      ./wg-pbr.sh reapply              Re-apply firewall rules for all registered interfaces.
+      ./wg-pbr.sh status [iface]       Show status of all or a specific interface.
+      ./wg-pbr.sh unstage [iface]      Remove staged configuration(s) before commit.
+
+    Target Management (requires 05-manage-commands.sh plugin):
+      ./wg-pbr.sh assign-ip <iface> <IPs>   Add IPs/subnets to an interface (accumulates until commit).
+      ./wg-pbr.sh remove-ip <iface> <IPs>   Remove IPs/subnets from an interface.
     ```
 
     ```sh
@@ -57,6 +63,10 @@ Tested on Route10 firmware version `1.4o`.
 
     # Apply all staged configurations
     ./wg-pbr.sh commit
+
+    # Hot-reload: Move a client between interfaces without restarting tunnels
+    ./wg-pbr.sh assign-ip wg1 192.168.1.55   # Automatically removes from wg0
+    ./wg-pbr.sh commit                        # Updates routing instantly, no tunnel restart
     ```
 
 4. **Configure After Boot (Optional)**:

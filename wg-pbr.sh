@@ -8,12 +8,13 @@ usage() {
     echo "  Arguments for configuration:"
     echo "    <interface_name>:   WireGuard interface name (max 11 chars)"
     echo "    -c, --conf <file>:      Relative or absolute path to the wg conf file"
-    echo "    -t, --target-ips <IPs>:  Comma-separated list of IPv4 addresses or subnets"
+    echo "    -t, --target-ips <IPs>:  Comma-separated list of IPv4 addresses/subnets (optional)"
     echo "    -r, --routing-table <N>: (Optional) Routing table number, auto-allocated 100-199 if not provided"
     echo ""
     echo "Commands:"
     echo "  $0 commit               Apply all staged WireGuard interface configurations."
     echo "  $0 reapply              (Optional) Re-apply firewall rules for all registered interfaces (useful after boot)."
+    run_hook show_plugin_help
     exit 1
 }
 
@@ -21,9 +22,13 @@ trim() {
     echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
-STAGING_DB="/tmp/wg_pbr_staging_db"
-WG_REGISTRY="/tmp/wg_interface_registry"
-WG_MAC_STATE="/tmp/wg_mac_state"
+# Temp file directory - all wg-pbr temp files go here
+WG_TMP_DIR="/tmp/wg-custom"
+mkdir -p "$WG_TMP_DIR" 2>/dev/null || true
+
+STAGING_DB="${WG_TMP_DIR}/staging_db"
+WG_REGISTRY="${WG_TMP_DIR}/registry"
+WG_MAC_STATE="${WG_TMP_DIR}/mac_state"
 MASTER_DHCP_HOTPLUG="/etc/hotplug.d/dhcp/99-wg-master-pbr"
 
 # Plugin system
@@ -38,11 +43,18 @@ if [ -f "$COMMON_LIB" ]; then
     . "$COMMON_LIB"
 fi
 
+# Source SQLite database functions
+DB_LIB="$LIB_DIR/wg-db.sh"
+if [ -f "$DB_LIB" ]; then
+    . "$DB_LIB"
+    db_init 2>/dev/null || true
+fi
+
 # Inject library content into a generated script by replacing COMMON_LIB_PLACEHOLDER
 # Usage: inject_common_lib <target_script>
 inject_common_lib() {
     local target="$1"
-    local lib_content_file="/tmp/wg_lib_content_$$"
+    local lib_content_file="/tmp/wg-custom/lib_content_$$"
     
     if [ -f "$COMMON_LIB" ]; then
         # Extract library content (skip shebang and header comments)
@@ -59,7 +71,12 @@ inject_common_lib() {
 
 # Run hook: sources all plugins and calls the hook function if defined
 # Usage: run_hook <hook_name> [args...]
-# Available hooks (in execution order):
+#
+# Command handlers (run before workflow):
+#   - show_plugin_help        - When usage/help is displayed (args: none)
+#   - handle_command          - Before arg parsing, return 0 if handled (args: all CLI args)
+#
+# Workflow hooks (in execution order):
 #   1. pre_commit              - Before committing staged configs (args: none)
 #   2. pre_setup               - Before interface setup (args: INTERFACE_NAME WG_REGISTRY)
 #   3. process_ipv6_prefix     - For non-/128 IPv6 prefixes (args: ip6, prefix_len, addr_part)
@@ -71,6 +88,9 @@ run_hook() {
     
     [ -d "$PLUGIN_DIR" ] || return 0
     
+    # Clear any stale definition from previous run_hook calls
+    unset -f "${hook_name}" 2>/dev/null || true
+    
     for plugin in "$PLUGIN_DIR"/*.sh; do
         [ -f "$plugin" ] || continue
         
@@ -79,32 +99,34 @@ run_hook() {
         
         # Call the hook function if it exists
         if type "${hook_name}" >/dev/null 2>&1; then
-            "${hook_name}" "$@" || echo "Warning: Hook ${hook_name} in $(basename "$plugin") returned error"
+            if [ "$hook_name" = "handle_command" ]; then
+                # handle_command returns 0 if handled, 1 if not - don't warn on 1
+                if "${hook_name}" "$@"; then
+                    unset -f "${hook_name}" 2>/dev/null || true
+                    return 0
+                fi
+            else
+                "${hook_name}" "$@" || echo "Warning: Hook ${hook_name} in $(basename "$plugin") returned error"
+            fi
         fi
         
         # Unset the function to avoid calling it again from next plugin
         unset -f "${hook_name}" 2>/dev/null || true
     done
+    
+    # Only return 1 for handle_command (not handled), return 0 for all other hooks
+    [ "$hook_name" = "handle_command" ] && return 1 || return 0
 }
 
-# Update the WireGuard interface registry
+# Update the WireGuard interface registry (SQLite only)
 update_wg_registry() {
     local iface="$1" rt="$2" vpn_ips="$3" ipv6="$4" ip6_subs="$5" nat66="$6"
     # Convert space-separated to comma-separated for storage
     local vpn_ips_csv=$(echo "$vpn_ips" | tr ' ' ',')
-    # Remove old entry for this interface
-    sed -i "/^${iface}|/d" "$WG_REGISTRY" 2>/dev/null || true
-    touch "$WG_REGISTRY"
-    # Add new entry
-    echo "${iface}|${rt}|${vpn_ips_csv}|${ipv6}|${ip6_subs}|${nat66}" >> "$WG_REGISTRY"
-}
-
-# Remove interface from registry
-unregister_wg_interface() {
-    local iface="$1"
-    sed -i "/^${iface}|/d" "$WG_REGISTRY" 2>/dev/null || true
-    # Also clean up any MAC state entries pointing to this interface
-    sed -i "/|${iface}|/d" "$WG_MAC_STATE" 2>/dev/null || true
+    local start_time=$(date +%s)
+    
+    # Update SQLite database
+    db_update_registry "$iface" "$rt" "$vpn_ips_csv" "${ipv6:-0}" "$ip6_subs" "${nat66:-0}" "$start_time" 2>/dev/null || true
 }
 
 # Auto-allocate routing table (100-199 range for WireGuard)
@@ -118,21 +140,10 @@ allocate_routing_table() {
         used_tables=$(awk '{print $1}' "$rt_tables" 2>/dev/null | grep -E '^[0-9]+$' | sort -n)
     fi
     
-    # Check WireGuard registry (committed interfaces)
-    if [ -f "$WG_REGISTRY" ]; then
-        while IFS='|' read -r iface rt rest; do
-            used_tables="$used_tables $rt"
-        done < "$WG_REGISTRY"
-    fi
-    
-    # Check staging DB (staged but not yet committed interfaces)
-    if [ -f "$STAGING_DB" ]; then
-        while IFS='|' read -r iface cmd committed; do
-            # Extract routing table from staged command (--routing-table N)
-            staged_rt=$(echo "$cmd" | sed -n 's/.*--routing-table \([0-9]*\).*/\1/p')
-            [ -n "$staged_rt" ] && used_tables="$used_tables $staged_rt"
-        done < "$STAGING_DB"
-    fi
+    # Check SQLite database for used routing tables (covers both staged and committed)
+    for rt in $(db_get_all_routing_tables 2>/dev/null); do
+        used_tables="$used_tables $rt"
+    done
     
     local i=$start
     while [ $i -le $end ]; do
@@ -148,33 +159,53 @@ allocate_routing_table() {
 }
 
 if [ "$1" = "commit" ]; then
-    if [ -f "$STAGING_DB" ]; then
+    # Initialize database if needed
+    db_init 2>/dev/null || true
+    
+    # Check if any interfaces are staged
+    staged_list=$(db_list_staged 2>/dev/null)
+    if [ -n "$staged_list" ]; then
         echo "Committing staged configurations..."
         run_hook pre_commit
-        # Use a temporary file for the updated DB
-        touch "${STAGING_DB}.tmp"
         NEW_IFACES=""  # Track only newly staged interfaces
+        HOT_RELOAD_IFACES=""  # Track interfaces that only need target updates
+        rm -f "${WG_TMP_DIR}/deferred_dhcp.tmp"  # Clean up from any previous run
         
-        # Use file descriptor 3 to prevent eval from consuming stdin
-        exec 3< "$STAGING_DB"
-        while IFS='|' read -r iface cmd committed <&3; do
-            # Always try to apply configuration if it hasn't been successfully committed yet
-            if [ "$committed" != "true" ]; then
+        # Process each staged interface from SQLite
+        echo "$staged_list" | while IFS='|' read -r iface conf rt targets committed target_only; do
+            [ -z "$iface" ] && continue
+            
+            # Convert SQLite integers to shell booleans
+            [ "$committed" = "1" ] && committed="true" || committed="false"
+            [ "$target_only" = "1" ] && target_only="true" || target_only="false"
+            
+            # Check if this is a target-only change for an already-committed interface
+            if [ "$target_only" = "true" ] && [ "$committed" = "true" ]; then
+                # Hot-reload: Update ipset/registry with new targets
+                echo "Hot-reloading targets for $iface..."
+                update_ipset_targets "$iface" "$targets"
+                update_registry_targets "$iface" "$targets"
+                echo "$iface" >> "${WG_TMP_DIR}/hot_reload_ifaces.tmp"
+                # Reset target_only flag in database
+                db_set_target_only "$iface" 0
+            elif [ "$committed" != "true" ]; then
+                # Full setup needed - not yet committed
                 echo "Applying configuration for $iface..."
+                cmd=$(db_reconstruct_command "$iface" "$0")
                 if eval "$cmd --internal-exec"; then
-                    committed="true"
-                    NEW_IFACES="$NEW_IFACES $iface"  # This is a newly applied interface
+                    db_commit_interface "$iface"
+                    db_set_running "$iface" 1
+                    echo "$iface" >> "${WG_TMP_DIR}/new_ifaces.tmp"
                 else
                     echo "Error applying configuration for $iface"
-                    committed="false"
                 fi
             fi
-            
-            # Write back with current status
-            echo "$iface|$cmd|$committed" >> "${STAGING_DB}.tmp"
         done
-        exec 3<&-
-        mv "${STAGING_DB}.tmp" "$STAGING_DB"
+        
+        # Read back interface lists (needed because while loop runs in subshell)
+        NEW_IFACES=$(cat "${WG_TMP_DIR}/new_ifaces.tmp" 2>/dev/null | tr '\n' ' ')
+        HOT_RELOAD_IFACES=$(cat "${WG_TMP_DIR}/hot_reload_ifaces.tmp" 2>/dev/null | tr '\n' ' ')
+        rm -f "${WG_TMP_DIR}/new_ifaces.tmp" "${WG_TMP_DIR}/hot_reload_ifaces.tmp"
         
         # Only bring up newly staged interfaces (don't restart already running ones)
         for iface in $NEW_IFACES; do
@@ -187,6 +218,21 @@ if [ "$1" = "commit" ]; then
             ifup "$iface"
         done
         
+        for iface in $HOT_RELOAD_IFACES; do
+            echo "Hot-reloaded targets for $iface (no restart)"
+        done
+        
+        # Trigger deferred DHCP re-processing (read from temp file to survive subshell)
+        if [ -f "${WG_TMP_DIR}/deferred_dhcp.tmp" ]; then
+            for dhcp_ip in $(cat "${WG_TMP_DIR}/deferred_dhcp.tmp" | sort -u); do
+                dhcp_mac=$(ip neigh show | grep "^${dhcp_ip} " | awk '{print $5}' | head -1)
+                if [ -n "$dhcp_mac" ] && [ -f "$MASTER_DHCP_HOTPLUG" ]; then
+                    echo "Processing DHCP for $dhcp_ip ($dhcp_mac)"
+                    MACADDR="$dhcp_mac" IPADDR="$dhcp_ip" ACTION="add" "$MASTER_DHCP_HOTPLUG" || true
+                fi
+            done
+            rm -f "${WG_TMP_DIR}/deferred_dhcp.tmp"
+        fi
         # Setup DHCP hook if not already configured (required for roaming cleanup)
         DHCP_HOOK="/etc/dnsmasq-dhcp-hook.sh"
         SCRIPT_DIR=$(dirname "$0")
@@ -234,23 +280,32 @@ fi
 
 if [ "$1" = "reapply" ]; then
     echo "Re-applying firewall rules for all registered WireGuard interfaces..."
-    if [ -f "$WG_REGISTRY" ]; then
-        while IFS='|' read -r iface rt vpn_ips ipv6_sup vpn_ip6_subs vpn_ip6_nat66; do
-            if [ -n "$iface" ]; then
-                ROUTING_SCRIPT="/etc/hotplug.d/iface/99-${iface}-routing"
-                if [ -f "$ROUTING_SCRIPT" ] && [ -x "$ROUTING_SCRIPT" ]; then
-                    echo "Re-applying rules for $iface..."
-                    ACTION="fw-reload" INTERFACE="$iface" "$ROUTING_SCRIPT" 2>/dev/null || \
-                        echo "Warning: Failed to re-apply rules for $iface"
-                else
-                    echo "Warning: Routing script not found for $iface"
-                fi
+    db_init 2>/dev/null || true
+    
+    local interfaces=$(db_list_running 2>/dev/null)
+    if [ -n "$interfaces" ]; then
+        for iface in $interfaces; do
+            ROUTING_SCRIPT="/etc/hotplug.d/iface/99-${iface}-routing"
+            if [ -f "$ROUTING_SCRIPT" ] && [ -x "$ROUTING_SCRIPT" ]; then
+                echo "Re-applying rules for $iface..."
+                ACTION="fw-reload" INTERFACE="$iface" "$ROUTING_SCRIPT" 2>/dev/null || \
+                    echo "Warning: Failed to re-apply rules for $iface"
+            else
+                echo "Warning: Routing script not found for $iface"
             fi
-        done < "$WG_REGISTRY"
+        done
         echo "Reapply complete."
     else
         echo "No registered interfaces found."
     fi
+    exit 0
+fi
+
+# Handle -h/--help
+case "$1" in -h|--help) usage ;; esac
+
+# Allow plugins to handle custom commands
+if run_hook handle_command "$@"; then
     exit 0
 fi
 
@@ -326,8 +381,8 @@ if [ -z "$ROUTING_TABLE_OVERRIDE" ]; then
 fi
 
 if [ -z "$VPN_IPS_OVERRIDE" ]; then
-    echo "Error: --target-ips <IPs_comma_separated> is required"
-    usage
+    echo "Note: No target IPs specified. Use 'assign-ip' to add targets later."
+    VPN_IPS_OVERRIDE="none"
 fi
 
 # Validate routing table is a positive number
@@ -343,17 +398,11 @@ fi
 
 # --- STAGING LOGIC ---
 if [ "$INTERNAL_EXEC" -eq 0 ]; then
-    # Reconstruct the command for staging
-    FULL_CMD="$0 $INTERFACE_NAME --conf $CONFIG_FILE --routing-table $ROUTING_TABLE_OVERRIDE --target-ips $VPN_IPS_OVERRIDE"
+    # Convert config path to absolute for consistent display
+    CONFIG_FILE_ABS=$(cd "$(dirname "$CONFIG_FILE")" && pwd)/$(basename "$CONFIG_FILE")
     
-    # Ensure DB file exists
-    touch "$STAGING_DB"
-    
-    # Remove existing entry for this interface to update it
-    sed -i "/^$INTERFACE_NAME|/d" "$STAGING_DB"
-    
-    # Append new entry
-    echo "$INTERFACE_NAME|$FULL_CMD|false" >> "$STAGING_DB"
+    # Stage to SQLite database
+    db_set_staged "$INTERFACE_NAME" "$CONFIG_FILE_ABS" "$ROUTING_TABLE_OVERRIDE" "$VPN_IPS_OVERRIDE" 0 0
     
     echo "Configuration staged for $INTERFACE_NAME."
     echo "Run '$0 commit' to apply changes."
@@ -462,14 +511,16 @@ if [ -n "$VPN_DNS_SERVERS" ]; then
     ipset create $IPSET_NAME hash:net 2>/dev/null || ipset flush $IPSET_NAME
     ipset create $IPSET_NAME_V6 hash:net family inet6 2>/dev/null || ipset flush $IPSET_NAME_V6
 
-    # Add all VPN-bound subnets/IPs to the set
-    for item in $VPN_IPS; do
-        if echo "$item" | grep -q ":"; then
-             ipset add $IPSET_NAME_V6 $item 2>/dev/null
-        else
-             ipset add $IPSET_NAME $item 2>/dev/null
-        fi
-    done
+    # Add all VPN-bound subnets/IPs to the set (skip if 'none')
+    if [ "$VPN_IPS" != "none" ]; then
+        for item in $VPN_IPS; do
+            if echo "$item" | grep -q ":"; then
+                 ipset add $IPSET_NAME_V6 $item 2>/dev/null
+            else
+                 ipset add $IPSET_NAME $item 2>/dev/null
+            fi
+        done
+    fi
     
     # Also add routable IPv6 subnets to the IPv6 set
     if [ -n "$VPN_IP6_SUBNETS" ]; then
@@ -493,7 +544,7 @@ INTERFACE_EXISTS=0
 if uci get network.$INTERFACE_NAME >/dev/null 2>&1; then INTERFACE_EXISTS=1; fi
 
 # Clean up old rules for this interface (essential for roaming/reconfiguration)
-cleanup_interface_rules "$INTERFACE_NAME" "$WG_REGISTRY"
+cleanup_interface_rules "$INTERFACE_NAME"
 
 # Run pre_setup hook for additional plugin processing
 run_hook pre_setup "$INTERFACE_NAME" "$WG_REGISTRY"
@@ -627,11 +678,13 @@ cat > /etc/hotplug.d/iface/99-${INTERFACE_NAME}-routing << 'EOF_IFACE_ROUTING'
 [ "$INTERFACE" = "INTERFACE_NAME_PLACEHOLDER" ] || exit 0
 
 # Acquire lock to prevent race conditions with other WireGuard interfaces
-LOCK_FILE="/tmp/wg_iface_routing.lock"
+WG_TMP_DIR="/tmp/wg-custom"
+mkdir -p "$WG_TMP_DIR" 2>/dev/null || true
+LOCK_FILE="${WG_TMP_DIR}/iface_routing.lock"
 exec 201>"$LOCK_FILE"
 flock -x 201 || exit 1
 
-trap 'rm -f /tmp/neigh_${WG_INTERFACE}_$$; flock -u 201' EXIT
+trap 'rm -f ${WG_TMP_DIR}/neigh_${WG_INTERFACE}_$$; flock -u 201' EXIT
 
 ROUTING_TABLE="ROUTING_TABLE_PLACEHOLDER"
 IPV6_SUPPORTED="IPV6_SUPPORTED_PLACEHOLDER"
@@ -882,7 +935,7 @@ apply_ipv6_rules() {
 
             if [ -n "$ipv6_addrs" ]; then
                 ipv6_addr=$(echo "$ipv6_addrs" | head -n1)
-                STATE_FILE="/tmp/wg_prefix_${WG_INTERFACE}_${mac_addr//:/}"
+                STATE_FILE="${WG_TMP_DIR}/prefix_${WG_INTERFACE}_${mac_addr//:/}"
                 
                 # Check if this IPv6 address is within a routable VPN subnet
                 # VPN_IP6_SUBNETS is provided by the main script
@@ -1056,6 +1109,7 @@ if [ "$IPV6_SUPPORTED" = "1" ]; then
     # Get DHCP lease file location
     DHCP_LEASE_FILE=$(get_dhcp_lease_file)
 
+if [ "$VPN_IPS" != "none" ]; then
     for item in $VPN_IPS; do
         case "$item" in
             */*) # Subnet
@@ -1101,6 +1155,7 @@ if [ "$IPV6_SUPPORTED" = "1" ]; then
                 ;;
         esac
     done
+fi
     
     # Apply marking rules to PREROUTING
     lan_ifaces=$(get_lan_ifaces)
@@ -1141,6 +1196,7 @@ else
     PROCESSED_MACS_BLOCK=""
     DHCP_LEASE_FILE=$(get_dhcp_lease_file)
     
+if [ "$VPN_IPS" != "none" ]; then
     for item in $VPN_IPS; do
         # Skip IPv6 addresses
         echo "$item" | grep -q ":" && continue
@@ -1194,6 +1250,7 @@ else
                 ;;
         esac
     done
+fi
     
     logger -t wireguard "[$WG_INTERFACE] IPv6 blocking applied for existing clients"
 fi
@@ -1201,13 +1258,15 @@ fi
 # Create/Flush ipset on every ifup to prevent race condition
 logger -t wireguard "[$WG_INTERFACE] Creating/flushing ipset $IPSET_NAME."
 ipset create $IPSET_NAME hash:net 2>/dev/null || ipset flush $IPSET_NAME
-for item in $VPN_IPS; do
-    if echo "$item" | grep -q ":"; then
-         ipset add $IPSET_NAME_V6 $item 2>/dev/null
-    else
-         ipset add $IPSET_NAME $item 2>/dev/null
-    fi
-done
+if [ "$VPN_IPS" != "none" ]; then
+    for item in $VPN_IPS; do
+        if echo "$item" | grep -q ":"; then
+             ipset add $IPSET_NAME_V6 $item 2>/dev/null
+        else
+             ipset add $IPSET_NAME $item 2>/dev/null
+        fi
+    done
+fi
 
 # CRITICAL: Block WAN DNS responses to VPN clients (IPv4) - applied EARLY
 logger -t wireguard "[$WG_INTERFACE] Blocking WAN DNS responses to VPN clients (IPv4)"
@@ -1281,6 +1340,7 @@ PROCESSED_MACS=""
 # Get DHCP lease file location (reuse helper)
 DHCP_LEASE_FILE=$(get_dhcp_lease_file)
 
+if [ "$VPN_IPS" != "none" ]; then
 for item in $VPN_IPS; do
     case "$item" in
         */*) # This is a subnet
@@ -1326,12 +1386,14 @@ for item in $VPN_IPS; do
             ;;
     esac
 done
+fi
 
-# Restore rules for clients registered in MAC state file (for fw-reload via 'reapply' command)
+# Restore rules for clients registered in SQLite MAC state (for fw-reload via 'reapply' command)
 # This ensures DHCP hotplug added clients don't lose their rules after rule re-application
-WG_MAC_STATE="/tmp/wg_mac_state"
-if [ -f "$WG_MAC_STATE" ] && [ "$IPV6_SUPPORTED" = "1" ]; then
-    logger -t wireguard "[$WG_INTERFACE] Restoring block rules from MAC state file..."
+WG_DB_PATH="${WG_TMP_DIR}/wg_pbr.db"
+if [ -f "$WG_DB_PATH" ] && [ "$IPV6_SUPPORTED" = "1" ]; then
+    logger -t wireguard "[$WG_INTERFACE] Restoring block rules from SQLite MAC state..."
+    sqlite3 -separator '|' "$WG_DB_PATH" "SELECT mac, interface, ip, routing_table, ipv6_support FROM mac_state WHERE interface = '$WG_INTERFACE';" 2>/dev/null | \
     while IFS='|' read -r mac iface ip rt ipv6_sup; do
         # Debug: log what we're comparing
         logger -t wireguard "[$WG_INTERFACE] DEBUG: MAC=$mac IFACE=$iface (expect $WG_INTERFACE)"
@@ -1361,7 +1423,7 @@ if [ -f "$WG_MAC_STATE" ] && [ "$IPV6_SUPPORTED" = "1" ]; then
                 ip6tables -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT
             fi
         fi
-    done < "$WG_MAC_STATE"
+    done
 fi
 
 # Setup VPN DNS redirect if DNS servers are configured
@@ -1371,16 +1433,16 @@ fi
 
 ip route flush cache; ip -6 route flush cache 2>/dev/null
 
-# Update Registry on ifup to ensure persistence across restarts
-WG_REGISTRY="/tmp/wg_interface_registry"
-# Convert space-separated to comma-separated for storage
-VPN_IPS_CSV=$(echo "$VPN_IPS" | tr ' ' ',')
-# Remove old entry for this interface
-sed -i "/^${WG_INTERFACE}|/d" "$WG_REGISTRY" 2>/dev/null || true
-touch "$WG_REGISTRY"
-# Add new entry
-echo "${WG_INTERFACE}|${ROUTING_TABLE}|${VPN_IPS_CSV}|${IPV6_SUPPORTED}|${VPN_IP6_SUBNETS}|${VPN_IP6_NEEDS_NAT66}" >> "$WG_REGISTRY"
-logger -t wireguard "[$WG_INTERFACE] Registered interface in registry."
+# Update SQLite registry on ifup to ensure start_time is accurate
+WG_TMP_DIR="/tmp/wg-custom"
+mkdir -p "$WG_TMP_DIR" 2>/dev/null || true
+WG_DB_PATH="${WG_TMP_DIR}/wg_pbr.db"
+# Update start_time and running status in SQLite
+START_TIME=$(date +%s)
+if [ -f "$WG_DB_PATH" ]; then
+    sqlite3 "$WG_DB_PATH" "UPDATE interfaces SET start_time = $START_TIME, running = 1 WHERE name = '$WG_INTERFACE';"
+fi
+logger -t wireguard "[$WG_INTERFACE] Updated interface start_time in SQLite."
 
 # Add a final dnsmasq reload to ensure it binds to the ipset
 logger -t wireguard "[$WG_INTERFACE] Performing guaranteed dnsmasq reload."
@@ -1557,6 +1619,7 @@ iptables -N $KS_CHAIN 2>/dev/null; ip6tables -N $KS_CHAIN 2>/dev/null
 iptables -C FORWARD -j $KS_CHAIN 2>/dev/null || iptables -I FORWARD 1 -j $KS_CHAIN
 ip6tables -C FORWARD -j $KS_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $KS_CHAIN
 
+if [ "$VPN_IPS" != "none" ]; then
 for item in $VPN_IPS; do
     logger -t wireguard "[$WG_INTERFACE] Blocking all traffic from $item."
     iptables -A $KS_CHAIN -s $item -j REJECT --reject-with icmp-host-prohibited
@@ -1578,6 +1641,7 @@ for item in $VPN_IPS; do
             ;;
     esac
 done
+fi
 
 ip route flush table $ROUTING_TABLE 2>/dev/null
 ip -6 route flush table $ROUTING_TABLE 2>/dev/null
@@ -1599,18 +1663,20 @@ ipset destroy $IPSET_NAME_V6 2>/dev/null
 ( /etc/init.d/dnsmasq reload >/dev/null 2>&1 ) &
 
 # Clean up IPv6 prefix state files
+WG_TMP_DIR="/tmp/wg-custom"
 logger -t wireguard "[$WG_INTERFACE] Cleaning up IPv6 prefix state files."
-rm -f /tmp/wg_prefix_${WG_INTERFACE}_*
+rm -f ${WG_TMP_DIR}/prefix_${WG_INTERFACE}_*
 logger -t wireguard "[$WG_INTERFACE] Cleaning up IPv4 state files."
-rm -f /tmp/wg_ip_${WG_INTERFACE}_*
+rm -f ${WG_TMP_DIR}/ip_${WG_INTERFACE}_*
 
-# Unregister from WireGuard interface registry
-WG_REGISTRY="/tmp/wg_interface_registry"
-WG_MAC_STATE="/tmp/wg_mac_state"
-logger -t wireguard "[$WG_INTERFACE] Removing from interface registry."
-sed -i "/^${WG_INTERFACE}|/d" "$WG_REGISTRY" 2>/dev/null || true
+# Unregister from WireGuard interface registry (SQLite)
+WG_DB_PATH="${WG_TMP_DIR}/wg_pbr.db"
+logger -t wireguard "[$WG_INTERFACE] Removing from interface registry and MAC state."
 # Clean up MAC state entries pointing to this interface
-sed -i "/|${WG_INTERFACE}|/d" "$WG_MAC_STATE" 2>/dev/null || true
+if [ -f "$WG_DB_PATH" ]; then
+    sqlite3 "$WG_DB_PATH" "DELETE FROM mac_state WHERE interface = '$WG_INTERFACE';" 2>/dev/null || true
+    sqlite3 "$WG_DB_PATH" "UPDATE interfaces SET running = 0 WHERE name = '$WG_INTERFACE';" 2>/dev/null || true
+fi
 
 # Note: We do NOT remove the master DHCP hotplug script here even if registry is empty.
 # This prevents race conditions at boot where cleanup runs before new interfaces come up.
