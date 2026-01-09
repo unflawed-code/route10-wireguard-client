@@ -47,12 +47,11 @@ Tested on Route10 firmware version `1.4o`.
     Commands:
       ./wg-pbr.sh commit               Apply all staged WireGuard interface configurations.
       ./wg-pbr.sh reapply              Re-apply firewall rules for all registered interfaces.
-      ./wg-pbr.sh status [iface]       Show status of all or a specific interface.
-      ./wg-pbr.sh unstage [iface]      Remove staged configuration(s) before commit.
 
     Target Management (requires 05-manage-commands.sh plugin):
-      ./wg-pbr.sh assign-ip <iface> <IPs>   Add IPs/subnets to an interface (accumulates until commit).
-      ./wg-pbr.sh remove-ip <iface> <IPs>   Remove IPs/subnets from an interface.
+      ./wg-pbr.sh status [iface]             Show detailed status of all or specific interface.
+      ./wg-pbr.sh assign-ips <iface> <IPs>   Add IPs/subnets to an interface (accumulates until commit).
+      ./wg-pbr.sh remove-ips <iface> <IPs>   Remove IPs/subnets from an interface (accumulates until commit).
     ```
 
     ```sh
@@ -65,7 +64,7 @@ Tested on Route10 firmware version `1.4o`.
     ./wg-pbr.sh commit
 
     # Hot-reload: Move a client between interfaces without restarting tunnels
-    ./wg-pbr.sh assign-ip wg1 192.168.1.55   # Automatically removes from wg0
+    ./wg-pbr.sh assign-ips wg1 192.168.1.55   # Automatically removes from wg0
     ./wg-pbr.sh commit                        # Updates routing instantly, no tunnel restart
     ```
 
@@ -73,9 +72,9 @@ Tested on Route10 firmware version `1.4o`.
     - Copy `post-cfg-template.sh` to `post-cfg.sh` (if not already done).
     - Edit `post-cfg.sh` to correct the paths:
 
-        ```ash
+        ```sh
         CONF_DIR="/path/to/your/wg/conf/files"
-        WG_IPS_SCRIPT="/path/to/wg-pbr.sh"
+        WG_PBR_SCRIPT="/path/to/wg-pbr.sh"
         ```
 
     - Define your interfaces in `post-cfg.sh` using the `setup_interface` function.
@@ -85,7 +84,7 @@ Tested on Route10 firmware version `1.4o`.
 This project natively supports `/128` IPv6 prefixes (single address) using **NAT66** (Network Address Translation for IPv6). NAT66 allows multiple LAN clients to share the VPN's single IPv6 address, similar to how NAT44 works for IPv4.
 
 > [!NOTE]
-> Support for other prefix sizes (e.g., `/64`) requires creating a plugin. The script will still use NAT66 once the Wireguard interface receives an IPv6 address. See `plugins/README.md` for details.
+> Larger prefix sizes (e.g., `/64`) are supported via the included `03-ipv6-prefix-routing.sh` plugin. See `plugins/README.md` for details.
 
 ### Why /128?
 
