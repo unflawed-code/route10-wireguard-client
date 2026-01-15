@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS interfaces (
     conf TEXT,
     routing_table INTEGER,
     target_ips TEXT,
+    domains TEXT,
     committed INTEGER DEFAULT 0,
     target_only INTEGER DEFAULT 0,
     ipv6_support INTEGER DEFAULT 0,
@@ -24,7 +25,8 @@ CREATE TABLE IF NOT EXISTS interfaces (
     running INTEGER DEFAULT 0
 );
 
--- Add target_only column if missing (migration for existing DBs)
+-- Add missing columns if needed (migration for existing DBs)
+ALTER TABLE interfaces ADD COLUMN domains TEXT;
 ALTER TABLE interfaces ADD COLUMN target_only INTEGER DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS mac_state (
@@ -98,7 +100,7 @@ db_update_targets() {
 
 # Get interface data as pipe-delimited string
 # Usage: db_get_interface <name>
-# Returns: name|conf|routing_table|target_ips|committed|target_only|ipv6_support|ipv6_subnets|nat66|start_time|running
+# Returns: name|conf|routing_table|target_ips|domains|committed|target_only|ipv6_support|ipv6_subnets|nat66|start_time|running
 db_get_interface() {
     local name="$1"
     sqlite3 -separator '|' "$WG_DB_PATH" "SELECT * FROM interfaces WHERE name = '$name';"

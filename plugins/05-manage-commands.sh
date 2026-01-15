@@ -138,16 +138,17 @@ cmd_status() {
     local db_entry=$(db_get_interface "$iface" 2>/dev/null)
     
     if [ -n "$db_entry" ]; then
-        # Parse SQLite entry: name|conf|routing_table|target_ips|committed|target_only|ipv6_support|ipv6_subnets|nat66|start_time|running
+        # Parse SQLite entry: name|conf|routing_table|target_ips|domains|committed|target_only|ipv6_support|ipv6_subnets|nat66|start_time|running
         local rt=$(echo "$db_entry" | cut -d'|' -f3)
         local vpn_ips=$(echo "$db_entry" | cut -d'|' -f4)
-        local committed=$(echo "$db_entry" | cut -d'|' -f5)
-        # Field 6 is target_only (not used in status display)
-        local ipv6=$(echo "$db_entry" | cut -d'|' -f7)
-        local ip6_subs=$(echo "$db_entry" | cut -d'|' -f8)
-        local nat66=$(echo "$db_entry" | cut -d'|' -f9)
-        local start_time=$(echo "$db_entry" | cut -d'|' -f10)
-        local running=$(echo "$db_entry" | cut -d'|' -f11)
+        # Field 5 is domains (not used in status display)
+        local committed=$(echo "$db_entry" | cut -d'|' -f6)
+        # Field 7 is target_only (not used in status display)
+        local ipv6=$(echo "$db_entry" | cut -d'|' -f8)
+        local ip6_subs=$(echo "$db_entry" | cut -d'|' -f9)
+        local nat66=$(echo "$db_entry" | cut -d'|' -f10)
+        local start_time=$(echo "$db_entry" | cut -d'|' -f11)
+        local running=$(echo "$db_entry" | cut -d'|' -f12)
         local conf=$(echo "$db_entry" | cut -d'|' -f2)
         
         echo "Routing Table: $rt (${iface}_rt)"

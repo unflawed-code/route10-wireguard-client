@@ -282,7 +282,7 @@ if [ "$1" = "reapply" ]; then
     echo "Re-applying firewall rules for all registered WireGuard interfaces..."
     db_init 2>/dev/null || true
     
-    local interfaces=$(db_list_running 2>/dev/null)
+    interfaces=$(db_list_running 2>/dev/null)
     if [ -n "$interfaces" ]; then
         for iface in $interfaces; do
             ROUTING_SCRIPT="/etc/hotplug.d/iface/99-${iface}-routing"
