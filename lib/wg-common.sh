@@ -249,6 +249,28 @@ cleanup_mac_for_ip() {
     ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p udp --dport 53 -j REJECT 2>/dev/null || true
     ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT 2>/dev/null || true
     
+    # Remove IPv4 DNS block rules (filter chains for DoT/DoH blocking)
+    local dns_block_chain="vpn_dns_block_${iface}"
+    local dns_filter_chain="vpn_dns_filter_${iface}"
+    
+    # Clean up DNS block rules by IP (port 53 blocking)
+    iptables -D $dns_block_chain -s $removed_ip -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+    iptables -D $dns_block_chain -s $removed_ip -p tcp --dport 53 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+    
+    # Clean up DoT block rules by IP (port 853)
+    iptables -D $dns_filter_chain -s $removed_ip -p udp --dport 853 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+    iptables -D $dns_filter_chain -s $removed_ip -p tcp --dport 853 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+    
+    # Clean up DoH block rules by IP (port 443 with string matching)
+    # Get domains from https-dns-proxy config and clean up each
+    if [ -f /etc/config/https-dns-proxy ]; then
+        local domains=$(grep 'resolver_url' /etc/config/https-dns-proxy 2>/dev/null | awk -F'/' '{print $3}')
+        for domain in $domains; do
+            iptables -D $dns_filter_chain -s $removed_ip -p tcp --dport 443 -m string --algo bm --string "$domain" -j REJECT --reject-with tcp-reset 2>/dev/null || true
+            iptables -D $dns_filter_chain -s $removed_ip -p udp --dport 443 -m string --algo bm --string "$domain" -j REJECT --reject-with tcp-reset 2>/dev/null || true
+        done
+    fi
+    
     # Remove MAC state entry from SQLite
     sqlite3 "$WG_DB_PATH" "DELETE FROM mac_state WHERE interface = '$iface' AND mac = '$mac';" 2>/dev/null || true
     
