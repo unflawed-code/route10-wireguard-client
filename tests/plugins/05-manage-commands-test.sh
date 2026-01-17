@@ -405,6 +405,58 @@ else
         ./wg-pbr.sh remove-ips "$MOVE_IFACE_B" "$HOTFIX_TEST_IP" > /dev/null 2>&1
         ./wg-pbr.sh commit > /dev/null 2>&1
     fi
+    
+    # --- Test 24: IPv4 DNS Block Rule Cleanup ---
+    # This tests the fix for: stale vpn_dns_block and vpn_dns_filter rules
+    # causing clients to lose internet when removed from VPN routing
+    echo ""
+    log_info "=== Testing IPv4 DNS/DoT Rule Cleanup ==="
+    
+    DNS_CLEANUP_TEST_IP="10.68.0.200"
+    DNS_CLEANUP_TEST_MAC="bb:cc:dd:ee:ff:00"
+    
+    # Simulate client in ARP cache
+    ip neigh replace $DNS_CLEANUP_TEST_IP lladdr $DNS_CLEANUP_TEST_MAC dev br-lan nud reachable 2>/dev/null || true
+    
+    # Step 1: Assign IP and commit (creates DNS block rules)
+    log_info "Step 1: Assigning $DNS_CLEANUP_TEST_IP to $MOVE_IFACE_A..."
+    ./wg-pbr.sh assign-ips "$MOVE_IFACE_A" "$DNS_CLEANUP_TEST_IP" > /dev/null 2>&1
+    ./wg-pbr.sh commit > /dev/null 2>&1
+    
+    # Wait for DHCP processing to create rules
+    sleep 1
+    
+    # Step 2: Verify DNS block rule exists (port 53)
+    log_info "Step 2: Verifying DNS block rule created..."
+    if iptables -L "vpn_dns_block_${MOVE_IFACE_A}" -n 2>/dev/null | grep -q "$DNS_CLEANUP_TEST_IP"; then
+        log_pass "DNS block rule created for $DNS_CLEANUP_TEST_IP"
+        
+        # Step 3: Remove IP and commit (should clean up DNS block rules)
+        log_info "Step 3: Removing $DNS_CLEANUP_TEST_IP (triggers cleanup)..."
+        ./wg-pbr.sh remove-ips "$MOVE_IFACE_A" "$DNS_CLEANUP_TEST_IP" > /dev/null 2>&1
+        ./wg-pbr.sh commit > /dev/null 2>&1
+        
+        # Step 4: Verify DNS block rule cleaned up
+        log_info "Step 4: Verifying DNS block rule removed..."
+        if ! iptables-save | grep -q "$DNS_CLEANUP_TEST_IP.*dport 53"; then
+            log_pass "DNS block rules removed for $DNS_CLEANUP_TEST_IP"
+        else
+            log_fail "DNS block rules NOT removed for $DNS_CLEANUP_TEST_IP (stale rules!)"
+        fi
+        
+        # Step 5: Verify DoT block rule cleaned up (port 853)
+        log_info "Step 5: Verifying DoT block rule removed..."
+        if ! iptables-save | grep -q "$DNS_CLEANUP_TEST_IP.*dport 853"; then
+            log_pass "DoT block rules removed for $DNS_CLEANUP_TEST_IP"
+        else
+            log_fail "DoT block rules NOT removed for $DNS_CLEANUP_TEST_IP (stale rules!)"
+        fi
+    else
+        log_skip "DNS block chain not found (may not be configured for this interface)"
+    fi
+    
+    # Cleanup ARP entry
+    ip neigh del $DNS_CLEANUP_TEST_IP dev br-lan 2>/dev/null || true
 fi
 
 echo ""
