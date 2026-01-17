@@ -36,14 +36,14 @@ handle_command() {
             return 0
             ;;
         remove-ips)
-            [ -z "$2" ] || [ -z "$3" ] && echo "Error: remove-ips requires interface and IP(s)" && return 0
+            [ -z "$2" ] || [ -z "$3" ] && echo "Error: remove-ips requires interface and IP(s)" && return 1
             cmd_remove_ip "$2" "$3"
-            return 0
+            return $?
             ;;
         assign-ips)
-            [ -z "$2" ] || [ -z "$3" ] && echo "Error: assign-ips requires interface and IP(s)" && return 0
+            [ -z "$2" ] || [ -z "$3" ] && echo "Error: assign-ips requires interface and IP(s)" && return 1
             cmd_assign_ip "$2" "$3"
-            return 0
+            return $?
             ;;
     esac
     return 1
