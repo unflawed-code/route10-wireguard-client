@@ -34,11 +34,14 @@ else
     echo "[WARN] Handshake might be stale (last: $AGE seconds ago)"
 fi
 
-# 3. Routing Rules (Priority 50)
-if ip rule show | grep -q "lookup 200"; then
-    echo "[PASS] PBR Routing rules (table 200) exist"
+# 3. Routing Rules
+# Get routing table ID from database
+ROUTING_TABLE=$(sqlite3 "/tmp/wg-custom/wg_pbr.db" "SELECT routing_table FROM interfaces WHERE name='$INTERFACE';" 2>/dev/null)
+
+if [ -n "$ROUTING_TABLE" ] && ip rule show | grep -q "lookup $ROUTING_TABLE"; then
+    echo "[PASS] PBR Routing rules (table $ROUTING_TABLE) exist"
 else
-    echo "[FAIL] PBR Routing rules missing!"
+    echo "[FAIL] PBR Routing rules for table $ROUTING_TABLE missing!"
 fi
 
 if ip rule show | grep -q "^49:"; then
@@ -56,7 +59,8 @@ fi
 
 # 5. IPSet / DNS Check
 echo "Resolving $DOMAIN to trigger IPSet population..."
-IP=$(nslookup "$DOMAIN" 127.0.0.1 | tail -n +3 | grep "Address" | awk '{print $3}' | head -n 1)
+# Try resolving without forcing 127.0.0.1 first, as dnsmasq might bind elsewhere (e.g. ::1)
+IP=$(nslookup "$DOMAIN" | tail -n +3 | grep "Address" | awk '{print $3}' | head -n 1)
 
 if [ -n "$IP" ]; then
     echo "Resolved $DOMAIN to $IP"

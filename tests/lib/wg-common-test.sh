@@ -119,6 +119,52 @@ assert_true is_in_list "192.168.50.99" "10.0.0.0/8 192.168.50.0/24"
 start_test "is_in_list (no match)"
 assert_false is_in_list "1.1.1.1" "2.2.2.2 3.3.3.3"
 
+# --- Test get_lan_ifaces() ---
+start_test "get_lan_ifaces"
+lan_ifaces=$(get_lan_ifaces)
+if [ -n "$lan_ifaces" ]; then
+    echo "${GREEN}PASS${NC} (Got: $lan_ifaces)"
+    pass_count=$((pass_count + 1))
+else
+    echo "${RED}FAIL${NC} (Got empty string)"
+    fail_count=$((fail_count + 1))
+fi
+
+# --- Test get_dhcp_lease_file() ---
+start_test "get_dhcp_lease_file"
+lease_file=$(get_dhcp_lease_file)
+if [ -n "$lease_file" ]; then
+    echo "${GREEN}PASS${NC} (Got: $lease_file)"
+    pass_count=$((pass_count + 1))
+else
+    echo "${RED}FAIL${NC} (Got empty string)"
+    fail_count=$((fail_count + 1))
+fi
+
+# --- Test discover_mac_for_ip() ---
+start_test "discover_mac_for_ip (integration)"
+# Create a dummy ARP entry for testing
+TEST_IP="192.0.2.222"
+TEST_MAC="aa:bb:cc:dd:ee:ff"
+
+# Try to add temp arp entry on br-lan (simulating a LAN client)
+if ip neigh replace "$TEST_IP" lladdr "$TEST_MAC" dev br-lan nud reachable 2>/dev/null; then
+    
+    discovered_mac=$(discover_mac_for_ip "$TEST_IP")
+    # Case insensitive check
+    if echo "$discovered_mac" | grep -qi "$TEST_MAC"; then
+        echo "${GREEN}PASS${NC} (Found $discovered_mac)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "${RED}FAIL${NC} - Expected $TEST_MAC, got '$discovered_mac'"
+        fail_count=$((fail_count + 1))
+    fi
+    # Cleanup
+    ip neigh del "$TEST_IP" dev br-lan 2>/dev/null
+else
+    echo "${YELLOW}SKIP${NC} (Could not create dummy ARP entry on br-lan)"
+fi
+
 # --- Summary ---
 echo "--------------------------------"
 echo "Tests Passed: $pass_count"
