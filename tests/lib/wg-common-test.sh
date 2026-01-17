@@ -16,6 +16,12 @@ fail_count=0
 
 test_name=""
 
+cleanup() {
+    # Remove dummy ARP entry if it exists
+    ip neigh del "192.0.2.222" dev br-lan 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
 start_test() {
     test_name="$1"
     echo -n "Testing $test_name... "

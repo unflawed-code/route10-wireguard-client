@@ -61,12 +61,6 @@ TEST_IP1="10.99.0.1"
 TEST_IP2="10.99.0.2"
 TEST_SUBNET="10.99.1.0/24"
 
-cleanup() {
-    log_info "Cleaning up test interface..."
-    # Remove test interface from SQLite database (but keep TEST_CONF for later tests)
-    sqlite3 "$WG_DB" "DELETE FROM interfaces WHERE name = '${TEST_IFACE}';" 2>/dev/null
-}
-
 # Helper to get staged targets for an interface from SQLite
 get_staged_targets() {
     local iface="$1"
@@ -80,8 +74,23 @@ interface_exists() {
     [ "$count" -gt 0 ]
 }
 
-# Run cleanup at start
-cleanup
+cleanup_all() {
+    log_info "Running cleanup..."
+    # Remove all test interfaces from SQLite database
+    sqlite3 "$WG_DB" "DELETE FROM interfaces WHERE name IN ('${TEST_IFACE}', '${TEST_SPLIT_IFACE:-wgtsplit}');" 2>/dev/null
+    
+    # Remove test config file
+    rm -f "$TEST_CONF" 2>/dev/null
+    
+    # Remove temporary cleanup script if it exists
+    rm -f /tmp/cleanup_test.sql 2>/dev/null
+}
+
+# Register cleanup trap
+trap cleanup_all EXIT INT TERM
+
+# Run cleanup at start to ensure clean state
+cleanup_all
 
 # Create dummy WireGuard config for testing
 cat > "$TEST_CONF" << 'EOF'
