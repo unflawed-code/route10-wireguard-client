@@ -308,6 +308,20 @@ VALUES ('$name', '$conf', $rt, '$targets', $committed, $target_only);
 EOF
 }
 
+# Stage a split-tunnel interface (domains instead of target_ips)
+# Usage: db_set_staged_split_tunnel <name> <conf> <rt> <domains>
+db_set_staged_split_tunnel() {
+    local name="$1"
+    local conf="$2"
+    local rt="$3"
+    local domains="$4"
+    
+    sqlite3 "$WG_DB_PATH" <<EOF
+INSERT OR REPLACE INTO interfaces (name, conf, routing_table, target_ips, domains, committed, target_only)
+VALUES ('$name', '$conf', $rt, 'none', '$domains', 0, 0);
+EOF
+}
+
 # Get staged interface info
 # Usage: db_get_staged <name>
 # Returns: name|conf|routing_table|target_ips|committed|target_only
@@ -318,9 +332,9 @@ db_get_staged() {
 
 # List all staged/committed interfaces
 # Usage: db_list_staged
-# Returns one line per interface: name|conf|routing_table|target_ips|committed|target_only
+# Returns one line per interface: name|conf|routing_table|target_ips|committed|target_only|domains
 db_list_staged() {
-    sqlite3 -separator '|' "$WG_DB_PATH" "SELECT name, conf, routing_table, target_ips, committed, target_only FROM interfaces ORDER BY name;"
+    sqlite3 -separator '|' "$WG_DB_PATH" "SELECT name, conf, routing_table, target_ips, committed, target_only, COALESCE(domains,'') FROM interfaces ORDER BY name;"
 }
 
 # Set target_only flag for hot-reload

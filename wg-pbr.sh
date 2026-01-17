@@ -1,19 +1,49 @@
 #!/bin/ash
+#
+# Route10 WireGuard Client Manager (wg-pbr.sh)
+# --------------------------------------------
+# Manages Policy-Based Routing (PBR) for WireGuard clients on OpenWrt.
+# Features:
+# - Per-client storage/isolation using SQLite (wg_pbr.db)
+# - Policy-based routing with dual-stack IPv4/IPv6 support
+# - Dynamic hot-reload of firewall rules and routes
+# - Handling of client movements (roaming) between VLANs
+# - Persistent state management across reboots
+#
+
+WG_VERSION="v2.3.0"
+export WG_VERSION
 
 set -e
 trap 'rm -f /tmp/neigh_*_$$' EXIT
 
+show_banner() {
+    local title="Route10 WireGuard Client with Policy-Based Routing ${WG_VERSION:-unknown}"
+    local len=${#title}
+    local border=""
+    local i=0
+    while [ $i -lt $len ]; do border="${border}-"; i=$((i+1)); done
+    
+    echo "+-${border}-+"
+    echo "| ${title} |"
+    echo "+-${border}-+"
+}
+
 usage() {
+    show_banner
     echo "Usage: $0 <interface_name> -c <config_file> -t <IPs_comma_separated> [-r <routing_table>]"
+    echo "       $0 <interface_name> -c <config_file> -d <domains_comma_separated>  (split-tunnel mode)"
     echo "  Arguments for configuration:"
     echo "    <interface_name>:   WireGuard interface name (max 11 chars)"
     echo "    -c, --conf <file>:      Relative or absolute path to the wg conf file"
     echo "    -t, --target-ips <IPs>:  Comma-separated list of IPv4 addresses/subnets (optional)"
-    echo "    -r, --routing-table <N>: (Optional) Routing table number, auto-allocated 100-199 if not provided"
+    echo "    -r, --routing-table <N>: (Optional) Routing table number, auto-allocated 100-599 if not provided"
+    echo "    -d, --domains <domains>: Comma-separated domains for split-tunnel (incompatible with -t/-r)"
     echo ""
     echo "Commands:"
     echo "  $0 commit               Apply all staged WireGuard interface configurations."
-    echo "  $0 reapply              (Optional) Re-apply firewall rules for all registered interfaces (useful after boot)."
+    echo "  $0 reapply              (Optional) Re-apply firewall rules for all registered interfaces."
+    echo "  $0 version              Show version information"
     run_hook show_plugin_help
     exit 1
 }
@@ -129,11 +159,23 @@ update_wg_registry() {
     db_update_registry "$iface" "$rt" "$vpn_ips_csv" "${ipv6:-0}" "$ip6_subs" "${nat66:-0}" "$start_time" 2>/dev/null || true
 }
 
-# Auto-allocate routing table (100-199 range for WireGuard)
+# Auto-allocate routing table (100-599 range for WireGuard)
+# If interface already has a table in DB, return that (idempotency)
+# Usage: allocate_routing_table [interface_name]
 allocate_routing_table() {
+    local iface="${1:-}"
     local start=100
-    local end=199
+    local end=599
     local rt_tables="/etc/iproute2/rt_tables"
+    
+    # Idempotency: Check if interface already has a routing table in DB
+    if [ -n "$iface" ]; then
+        local existing_rt=$(db_get_field "$iface" "routing_table" 2>/dev/null)
+        if [ -n "$existing_rt" ] && [ "$existing_rt" -ge $start ] && [ "$existing_rt" -le $end ]; then
+            echo "$existing_rt"
+            return 0
+        fi
+    fi
     
     local used_tables=""
     if [ -f "$rt_tables" ]; then
@@ -162,6 +204,9 @@ if [ "$1" = "commit" ]; then
     # Initialize database if needed
     db_init 2>/dev/null || true
     
+    # Wait for system to be ready if uptime is less than 60 seconds
+    wait_for_system_ready
+    
     # Check if any interfaces are staged
     staged_list=$(db_list_staged 2>/dev/null)
     if [ -n "$staged_list" ]; then
@@ -172,12 +217,29 @@ if [ "$1" = "commit" ]; then
         rm -f "${WG_TMP_DIR}/deferred_dhcp.tmp"  # Clean up from any previous run
         
         # Process each staged interface from SQLite
-        echo "$staged_list" | while IFS='|' read -r iface conf rt targets committed target_only; do
+        # Format: name|conf|routing_table|target_ips|committed|target_only|domains
+        echo "$staged_list" | while IFS='|' read -r iface conf rt targets committed target_only domains; do
             [ -z "$iface" ] && continue
             
             # Convert SQLite integers to shell booleans
             [ "$committed" = "1" ] && committed="true" || committed="false"
             [ "$target_only" = "1" ] && target_only="true" || target_only="false"
+            
+            # Check if this is a split-tunnel config (has domains)
+            if [ -n "$domains" ] && [ "$domains" != "" ]; then
+                # Split-tunnel mode
+                if [ "$committed" != "true" ]; then
+                    echo "Applying split-tunnel for $iface (domains: $domains)..."
+                    if "$LIB_DIR/wg-split-tunnel.sh" "$iface" -c "$conf" -d "$domains" -r "$rt"; then
+                        db_commit_interface "$iface"
+                        db_set_running "$iface" 1
+                        echo "$iface" >> "${WG_TMP_DIR}/split_tunnel_ifaces.tmp"
+                    else
+                        echo "Error applying split-tunnel for $iface"
+                    fi
+                fi
+                continue
+            fi
             
             # Check if this is a target-only change for an already-committed interface
             if [ "$target_only" = "true" ] && [ "$committed" = "true" ]; then
@@ -205,7 +267,14 @@ if [ "$1" = "commit" ]; then
         # Read back interface lists (needed because while loop runs in subshell)
         NEW_IFACES=$(cat "${WG_TMP_DIR}/new_ifaces.tmp" 2>/dev/null | tr '\n' ' ')
         HOT_RELOAD_IFACES=$(cat "${WG_TMP_DIR}/hot_reload_ifaces.tmp" 2>/dev/null | tr '\n' ' ')
-        rm -f "${WG_TMP_DIR}/new_ifaces.tmp" "${WG_TMP_DIR}/hot_reload_ifaces.tmp"
+        SPLIT_TUNNEL_IFACES=$(cat "${WG_TMP_DIR}/split_tunnel_ifaces.tmp" 2>/dev/null | tr '\n' ' ')
+        rm -f "${WG_TMP_DIR}/new_ifaces.tmp" "${WG_TMP_DIR}/hot_reload_ifaces.tmp" "${WG_TMP_DIR}/split_tunnel_ifaces.tmp"
+        
+        # Restart dnsmasq once if any split-tunnel interfaces were configured
+        if [ -n "$SPLIT_TUNNEL_IFACES" ]; then
+            echo "Restarting dnsmasq for split-tunnel domains..."
+            /etc/init.d/dnsmasq restart
+        fi
         
         # Only bring up newly staged interfaces (don't restart already running ones)
         for iface in $NEW_IFACES; do
@@ -216,6 +285,7 @@ if [ "$1" = "commit" ]; then
             
             # Bring up the interface
             ifup "$iface"
+            echo "Finished bringing up $iface."
         done
         
         for iface in $HOT_RELOAD_IFACES; do
@@ -301,8 +371,11 @@ if [ "$1" = "reapply" ]; then
     exit 0
 fi
 
-# Handle -h/--help
-case "$1" in -h|--help) usage ;; esac
+# Handle -h/--help and -v/--version
+case "$1" in 
+    -h|--help) usage ;;
+    -v|--version|version) show_banner; exit 0 ;;
+esac
 
 # Allow plugins to handle custom commands
 if run_hook handle_command "$@"; then
@@ -313,6 +386,7 @@ INTERFACE_NAME=""
 CONFIG_FILE=""
 ROUTING_TABLE_OVERRIDE=""
 VPN_IPS_OVERRIDE=""
+SPLIT_TUNNEL_DOMAINS=""
 INTERNAL_EXEC=0
 
 while [ $# -gt 0 ]; do
@@ -330,6 +404,11 @@ while [ $# -gt 0 ]; do
         -t|--target-ips)
             [ -z "$2" ] && echo "Error: --target-ips requires a value" && usage
             VPN_IPS_OVERRIDE=$(trim "$2")
+            shift 2
+            ;;
+        -d|--domains)
+            [ -z "$2" ] && echo "Error: --domains requires a value" && usage
+            SPLIT_TUNNEL_DOMAINS=$(trim "$2")
             shift 2
             ;;
         --internal-exec)
@@ -369,11 +448,54 @@ if [ -z "$CONFIG_FILE" ]; then
     usage
 fi
 
-if [ -z "$ROUTING_TABLE_OVERRIDE" ]; then
-    # Auto-allocate from 100-199 range
-    ROUTING_TABLE_OVERRIDE=$(allocate_routing_table)
+# Wait for system to be ready if uptime is less than 60 seconds (staging path)
+wait_for_system_ready
+
+# Split-tunnel mode: stage for commit (not immediate execution)
+if [ -n "$SPLIT_TUNNEL_DOMAINS" ]; then
+    # Validate: -d is incompatible with -t and -r
+    if [ -n "$VPN_IPS_OVERRIDE" ]; then
+        echo "Error: --domains (-d) cannot be used with --target-ips (-t)"
+        echo "Split-tunnel mode routes by domain, not by client IP."
+        exit 1
+    fi
+    if [ -n "$ROUTING_TABLE_OVERRIDE" ]; then
+        echo "Error: --domains (-d) cannot be used with --routing-table (-r)"
+        echo "Split-tunnel mode auto-allocates the routing table."
+        exit 1
+    fi
+    
+    # Validate split-tunnel script exists
+    SPLIT_TUNNEL_SCRIPT="$LIB_DIR/wg-split-tunnel.sh"
+    if [ ! -f "$SPLIT_TUNNEL_SCRIPT" ]; then
+        echo "Error: Split-tunnel script not found at $SPLIT_TUNNEL_SCRIPT"
+        exit 1
+    fi
+    
+    # Auto-allocate routing table for split-tunnel
+    ROUTING_TABLE_OVERRIDE=$(allocate_routing_table "$INTERFACE_NAME")
     if [ -z "$ROUTING_TABLE_OVERRIDE" ]; then
-        echo "Error: Could not allocate routing table (100-199 range exhausted)"
+        echo "Error: Could not allocate routing table (100-599 range exhausted)"
+        exit 1
+    fi
+    
+    # Convert config path to absolute
+    CONFIG_FILE_ABS=$(cd "$(dirname "$CONFIG_FILE")" && pwd)/$(basename "$CONFIG_FILE")
+    
+    # Stage split-tunnel configuration to DB
+    db_set_staged_split_tunnel "$INTERFACE_NAME" "$CONFIG_FILE_ABS" "$ROUTING_TABLE_OVERRIDE" "$SPLIT_TUNNEL_DOMAINS"
+    
+    echo "Split-tunnel configuration staged for $INTERFACE_NAME (table: $ROUTING_TABLE_OVERRIDE)"
+    echo "  Domains: $SPLIT_TUNNEL_DOMAINS"
+    echo "Run '$0 commit' to apply."
+    exit 0
+fi
+
+if [ -z "$ROUTING_TABLE_OVERRIDE" ]; then
+    # Auto-allocate from 100-599 range
+    ROUTING_TABLE_OVERRIDE=$(allocate_routing_table "$INTERFACE_NAME")
+    if [ -z "$ROUTING_TABLE_OVERRIDE" ]; then
+        echo "Error: Could not allocate routing table (100-599 range exhausted)"
         echo "Use -r <number> to specify your own routing table value"
         exit 1
     fi

@@ -12,6 +12,7 @@ Tested on Route10 firmware version `1.4o`.
 | Internet Kill Switch (IPv4/IPv6) :shield: | Ensures that traffic designated for the VPN is blocked if the tunnel is down. |
 | IPv6 Leak Prevention :droplet: | Prevents IPv6 traffic from bypassing the VPN tunnel via the default WAN gateway. |
 | IPv4/IPv6 DNS Leak Protection :droplet: | Redirects DNS queries through the VPN to prevent leaks to ISP or public DNS servers. |
+| Split Tunneling (Domain-based) | Route specific domains through VPN, clients already routed to another VPN are unaffected. |
 | Plugin Architecture | Extensible via hook scripts in `plugins/`. |
 
 ## Core Scripts
@@ -37,11 +38,12 @@ Tested on Route10 firmware version `1.4o`.
 3. **Run the Script**:
 
     ```sh
-    Usage: ./wg-pbr.sh <interface_name> -c <config_file> [-t <IPs_comma_separated>] [-r <routing_table>]
+    Usage: ./wg-pbr.sh <interface_name> -c <config_file> [ -t <IPs> [-r <routing_table>] | -d <domains> ]
       Arguments for configuration:
         <interface_name>:   WireGuard interface name (max 11 chars)
         -c, --conf <file>:      Relative or absolute path to the wg conf file
         -t, --target-ips <IPs>:  (Optional) Comma-separated list of IPv4 addresses/subnets
+        -d, --domains <domains>: (Optional) Comma-separated list of domains for split-tunnel (incompatible with -t/-r)
         -r, --routing-table <N>: (Optional) Routing table number, auto-allocated 100-199 if not provided
 
     Commands:
@@ -66,6 +68,9 @@ Tested on Route10 firmware version `1.4o`.
     # Hot-reload: Move a client between interfaces without restarting tunnels
     ./wg-pbr.sh assign-ips wg1 192.168.1.55   # Automatically removes from wg0
     ./wg-pbr.sh commit                        # Updates routing instantly, no tunnel restart
+
+    # Split-Tunnel (Domain-based): Route specific domains through VPN
+    ./wg-pbr.sh wg0 -c /etc/wireguard/wg0.conf -d "whatismyipaddress.com,ipleak.net"
     ```
 
 4. **Configure After Boot (Optional)**:
@@ -78,6 +83,31 @@ Tested on Route10 firmware version `1.4o`.
         ```
 
     - Define your interfaces in `post-cfg.sh` using the `setup_interface` function.
+
+## Domain-Based Split Tunneling
+
+Instead of routing specific clients *through* the VPN, you can route specific *domains* through the VPN for all clients, while keeping the rest of the traffic on the default gateway. Clients already routed to another VPN are not affected.
+
+### Usage
+
+```sh
+./wg-pbr.sh wg0 -c /cfg/wgx.conf -d "whatismyipaddress.com,ipleak.net"
+```
+
+### How It Works
+
+1. **dnsmasq & ipset**: The script configures `dnsmasq` to intercept DNS queries for the specified domains.
+2. **Dynamic Routing**: When a domain is resolved, the resulting IP addresses are added to an `ipset`.
+3. **Policy Routing**: Traffic to these IPs is marked and routed through the WireGuard tunnel.
+4. **Auto-Restart**: `dnsmasq` is automatically restarted during `commit` to ensure ipsets are populated correctly.
+
+### Important Notes
+
+- **Exclusive Mode**: Split-tunneling (`-d`) cannot be combined with IP-based routing (`-t`) or custom table assignment (`-r`). The interface is dedicated to routing these domains.
+- **IPv6 Behavior**:
+  - **If VPN supports IPv6**: Both IPv4 and IPv6 traffic to the domains are routed through the tunnel.
+  - **If VPN is IPv4-only**: IPv4 traffic is routed, but IPv6 traffic to the domains is **blocked** (DROP) to prevent leaks.
+- **DNS Handling**: The router's DNS must be set to `dnsmasq` (default OpenWrt behavior) for this to work.
 
 ## IPv6 Handling
 

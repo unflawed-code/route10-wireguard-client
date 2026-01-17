@@ -3,6 +3,26 @@
 # This file is injected into generated hotplug scripts at generation time.
 # DO NOT source this file at runtime - it is embedded directly.
 
+# === STRING UTILITIES ===
+
+# Trim leading and trailing whitespace
+# Usage: result=$(trim "  hello  ")
+trim() {
+    echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# Wait for system to be ready if uptime is less than 60 seconds
+# Usage: wait_for_system_ready
+wait_for_system_ready() {
+    local uptime_secs wait_secs
+    uptime_secs=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+    if [ -n "$uptime_secs" ] && [ "$uptime_secs" -lt 60 ]; then
+        wait_secs=$((60 - uptime_secs))
+        echo "System uptime is ${uptime_secs}s. Waiting ${wait_secs}s for system to be ready..."
+        sleep "$wait_secs"
+    fi
+}
+
 # === IP ADDRESS UTILITIES ===
 
 # Convert IPv4 address to integer for subnet calculations
