@@ -538,6 +538,45 @@ else
     ./wg-pbr.sh commit > /dev/null 2>&1
 fi
 
+# --- Test: Verify assign-ips fails for split-tunnel interface ---
+echo ""
+echo "=========================================="
+echo " Testing Split-Tunnel Exclusions"
+echo "=========================================="
+echo ""
+
+TEST_SPLIT_IFACE="wgtest_split"
+# Use same test conf
+log_info "Staging split-tunnel interface $TEST_SPLIT_IFACE..."
+./wg-pbr.sh "$TEST_SPLIT_IFACE" --conf "$TEST_CONF" -d "example.com" > /dev/null 2>&1
+
+if interface_exists "$TEST_SPLIT_IFACE"; then
+    log_pass "Split-tunnel interface staged"
+    
+    # Try to assign IP - SHOULD FAIL
+    log_info "Attempting to assign IP to split-tunnel interface (should fail)..."
+    if ./wg-pbr.sh assign-ips "$TEST_SPLIT_IFACE" "10.200.200.1" > /dev/null 2>&1; then
+        log_fail "assign-ips succeeded on split-tunnel interface (should be blocked)"
+    else
+        log_pass "assign-ips blocked on split-tunnel interface (correct)"
+    fi
+    
+    # Try to remove IP - SHOULD FAIL (though technically harmless, semantic block)
+    # The script blocks both target management commands for split-tunnel mode
+    log_info "Attempting to remove IP from split-tunnel interface (should fail)..."
+    if ./wg-pbr.sh remove-ips "$TEST_SPLIT_IFACE" "10.200.200.1" > /dev/null 2>&1; then
+        log_fail "remove-ips succeeded on split-tunnel interface (should be blocked)"
+    else
+        log_pass "remove-ips blocked on split-tunnel interface (correct)"
+    fi
+    
+    # Cleanup split interface
+    log_info "Cleaning up split-tunnel test interface..."
+    sqlite3 "$WG_DB" "DELETE FROM interfaces WHERE name = '${TEST_SPLIT_IFACE}';" 2>/dev/null
+else
+    log_fail "Failed to stage split-tunnel interface for testing"
+fi
+
 # --- Final Cleanup ---
 log_info "Final cleanup..."
 rm -f "$TEST_CONF" 2>/dev/null

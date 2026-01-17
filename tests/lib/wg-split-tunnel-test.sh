@@ -75,3 +75,29 @@ else
 fi
 
 echo "=== Test Complete ==="
+
+# 6. IPv6 Leak Protection & Bypass Verification
+echo "Checking IPv6 rules in chain split_${INTERFACE}..."
+
+# Check for VPN skip rules (should always exist for vpn6_*)
+if ip6tables -t mangle -S "split_${INTERFACE}" 2>/dev/null | grep -q "vpn6_.*RETURN"; then
+    echo "[PASS] IPv6 VPN skip rules (RETURN) found"
+else
+    # It might be valid if no other VPNs exist yet, but we expect the mechanism to be there.
+    # Actually the script loop over `ipset list`, so if no vpn6 ipsets exist, no rules are added.
+    # We should at least check if the chain exists.
+    if ip6tables -t mangle -L "split_${INTERFACE}" -n >/dev/null 2>&1; then
+        echo "[PASS] Split-tunnel IPv6 chain exists"
+    else
+        echo "[FAIL] Split-tunnel IPv6 chain missing"
+    fi
+fi
+
+# Check for DROP or MARK rule
+if ip6tables -t mangle -S "split_${INTERFACE}" 2>/dev/null | grep -q -- "-j DROP"; then
+    echo "[INFO] IPv6 DROP rule found (IPv6 blocking active - correct for IPv4-only tunnel)"
+elif ip6tables -t mangle -S "split_${INTERFACE}" 2>/dev/null | grep -q -- "-j MARK"; then
+    echo "[INFO] IPv6 MARK rule found (IPv6 routing active - correct for IPv6-enabled tunnel)"
+else
+    echo "[FAIL] Neither DROP nor MARK rule found for IPv6 (Potential LEAK!)"
+fi
