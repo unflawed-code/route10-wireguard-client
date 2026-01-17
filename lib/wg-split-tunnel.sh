@@ -235,12 +235,64 @@ setup_dns() {
     
     local old_ifs="$IFS"
     IFS=","
-    for domain in $DOMAINS; do
-        domain="$(trim "$domain")"
-        if [ -n "$domain" ]; then
-            echo "server=/$domain/$vpn_dns_primary" >> "$dnsmasq_conf"
-            echo "ipset=/$domain/$ipset_v4,$ipset_v6" >> "$dnsmasq_conf"
-        fi
+    for entry in $DOMAINS; do
+        entry="$(trim "$entry")"
+        [ -z "$entry" ] && continue
+        
+        # Wrap each entry in error handling to ensure one failure doesn't stop others
+        (
+            set +e  # Disable exit on error for this entry
+            
+            # Check if entry is an IP address (IPv4 or IPv6)
+            case "$entry" in
+                # IPv4: digits and dots only, with 3 dots
+                [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+                    # Attempt domain discovery via TLS certificate (required for IP entries)
+                    discovered_domain=""
+                    
+                    if command -v openssl >/dev/null 2>&1; then
+                        discovered_domain=$(echo | timeout 3 openssl s_client -connect "$entry:443" 2>/dev/null | \
+                            openssl x509 -noout -subject 2>/dev/null | \
+                            sed 's/.*CN = //' | sed 's/,.*//' | grep -v "^$") || true
+                    fi
+                    
+                    if [ -n "$discovered_domain" ]; then
+                        log "Adding IPv4 $entry (discovered domain: $discovered_domain)"
+                        ipset add "$ipset_v4" "$entry" 2>/dev/null || true
+                        echo "server=/$discovered_domain/$vpn_dns_primary" >> "$dnsmasq_conf"
+                        echo "ipset=/$discovered_domain/$ipset_v4,$ipset_v6" >> "$dnsmasq_conf"
+                    else
+                        log "ERROR: Rejecting $entry - no TLS certificate found (use domain name instead)"
+                    fi
+                    ;;
+                # IPv6: contains colons
+                *:*)
+                    # Attempt domain discovery via TLS certificate (required for IP entries)
+                    discovered_domain6=""
+                    
+                    if command -v openssl >/dev/null 2>&1; then
+                        discovered_domain6=$(echo | timeout 3 openssl s_client -connect "[$entry]:443" 2>/dev/null | \
+                            openssl x509 -noout -subject 2>/dev/null | \
+                            sed 's/.*CN = //' | sed 's/,.*//' | grep -v "^$") || true
+                    fi
+                    
+                    if [ -n "$discovered_domain6" ]; then
+                        log "Adding IPv6 $entry (discovered domain: $discovered_domain6)"
+                        ipset add "$ipset_v6" "$entry" 2>/dev/null || true
+                        echo "server=/$discovered_domain6/$vpn_dns_primary" >> "$dnsmasq_conf"
+                        echo "ipset=/$discovered_domain6/$ipset_v4,$ipset_v6" >> "$dnsmasq_conf"
+                    else
+                        log "ERROR: Rejecting $entry - no TLS certificate found (use domain name instead)"
+                    fi
+                    ;;
+                # Domain name: use dnsmasq
+                *)
+                    log "Adding domain to dnsmasq config: $entry"
+                    echo "server=/$entry/$vpn_dns_primary" >> "$dnsmasq_conf"
+                    echo "ipset=/$entry/$ipset_v4,$ipset_v6" >> "$dnsmasq_conf"
+                    ;;
+            esac
+        ) || log "ERROR: Failed to process entry: $entry (continuing with remaining entries)"
     done
     IFS="$old_ifs"
     

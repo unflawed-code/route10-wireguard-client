@@ -1,13 +1,19 @@
 #!/bin/sh
 
 # test.sh - Verification script for WG Split Tunnel
-# Usage: ./test.sh <interface> <domain>
+# Usage: ./test.sh <interface> <domain> [direct_ipv4] [direct_ipv6]
 
 INTERFACE="$1"
 DOMAIN="$2"
 
 if [ -z "$INTERFACE" ] || [ -z "$DOMAIN" ]; then
-    echo "Usage: $0 <interface> <domain>"
+    echo "Usage: $0 <interface> <domain> [direct_ipv4] [direct_ipv6]"
+    echo ""
+    echo "Arguments:"
+    echo "  interface    - WireGuard interface name"
+    echo "  domain       - Domain to test DNS-based ipset population"
+    echo "  direct_ipv4  - (Optional) IPv4 address passed to -d to verify direct ipset add"
+    echo "  direct_ipv6  - (Optional) IPv6 address passed to -d to verify direct ipset add"
     exit 1
 fi
 
@@ -78,9 +84,49 @@ else
     echo "[FAIL] Could not resolve $DOMAIN using local DNS"
 fi
 
+# 6. Direct IP Address Check (TLS certificate discovery feature)
+DIRECT_IP="$3"
+DIRECT_IP6="$4"
+
+if [ -n "$DIRECT_IP" ]; then
+    echo ""
+    echo "=== Testing TLS Certificate Discovery Feature ==="
+    IPSET_NAME="dst_vpn_${INTERFACE}"
+    DNSMASQ_CONF="/tmp/dnsmasq.d/${INTERFACE}-split.conf"
+    
+    # Check if IP is in ipset (means TLS succeeded)
+    if ipset list "$IPSET_NAME" 2>/dev/null | grep -q "$DIRECT_IP"; then
+        echo "[PASS] IPv4 $DIRECT_IP found in ipset (TLS discovery succeeded)"
+        
+        # Check if a domain was discovered and added to dnsmasq
+        if [ -f "$DNSMASQ_CONF" ]; then
+            # Look for any server= line that's not the explicitly provided domains
+            DISCOVERED=$(grep "server=/" "$DNSMASQ_CONF" | grep -v "$DOMAIN" | head -1 | sed 's/server=\/\([^/]*\).*/\1/')
+            if [ -n "$DISCOVERED" ]; then
+                echo "[PASS] Auto-discovered domain from TLS: $DISCOVERED"
+            else
+                echo "[INFO] No additional domain discovered (might be same as test domain)"
+            fi
+        fi
+    else
+        echo "[INFO] IPv4 $DIRECT_IP NOT in ipset (TLS discovery failed or IP rejected)"
+        echo "       This is expected if the IP has no valid TLS certificate"
+    fi
+fi
+
+if [ -n "$DIRECT_IP6" ]; then
+    IPSET6_NAME="dst6_vpn_${INTERFACE}"
+    
+    if ipset list "$IPSET6_NAME" 2>/dev/null | grep -q "$DIRECT_IP6"; then
+        echo "[PASS] IPv6 $DIRECT_IP6 found in ipset (TLS discovery succeeded)"
+    else
+        echo "[INFO] IPv6 $DIRECT_IP6 NOT in ipset (TLS discovery failed or IP rejected)"
+    fi
+fi
+
 echo "=== Test Complete ==="
 
-# 6. IPv6 Leak Protection & Bypass Verification
+# 7. IPv6 Leak Protection & Bypass Verification
 echo "Checking IPv6 rules in chain split_${INTERFACE}..."
 
 # Check for VPN skip rules (should always exist for vpn6_*)
