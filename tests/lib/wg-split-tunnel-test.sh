@@ -50,10 +50,12 @@ else
     echo "[FAIL] PBR Routing rules for table $ROUTING_TABLE missing!"
 fi
 
-if ip rule show | grep -q "^49:"; then
-    echo "[PASS] DNS Force-Routing rules (priority 49) exist"
+# Old priority 49 DNS routing removed - now uses fwmark-based DNS marking
+# Check for OUTPUT chain DNS marking instead
+if iptables -t mangle -S OUTPUT 2>/dev/null | grep -q -- "--dport 53.*MARK"; then
+    echo "[PASS] OUTPUT chain DNS marking rules exist"
 else
-    echo "[WARN] DNS Force-Routing rules missing (might be optional)"
+    echo "[WARN] OUTPUT chain DNS marking rules missing"
 fi
 
 # 4. Firewall Forwarding
@@ -79,6 +81,17 @@ if [ -n "$IP" ]; then
         echo "[FAIL] IP $IP NOT found in ipset $IPSET_NAME"
         echo "Current ipset contents:"
         ipset list "$IPSET_NAME" | head -5
+    fi
+    
+    # Check DNS server in dnsmasq config (may be Cloudflare fallback if conflict)
+    DNSMASQ_CONF="/tmp/dnsmasq.d/${INTERFACE}-split.conf"
+    if [ -f "$DNSMASQ_CONF" ]; then
+        DNS_SERVER=$(grep "server=/" "$DNSMASQ_CONF" | head -1 | sed 's/.*\/\([^/]*\)$/\1/')
+        if [ "$DNS_SERVER" = "1.1.1.1" ]; then
+            echo "[INFO] DNS conflict detected - using Cloudflare fallback (1.1.1.1)"
+        else
+            echo "[INFO] Using DNS server: $DNS_SERVER"
+        fi
     fi
 else
     echo "[FAIL] Could not resolve $DOMAIN using local DNS"

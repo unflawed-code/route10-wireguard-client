@@ -148,6 +148,43 @@ parse_config
 DNS_SERVERS=$(trim "$DNS_SERVERS")
 CLIENT_IP6=$(trim "$CLIENT_IP6")
 
+# === DNS CONFLICT DETECTION ===
+# Check if any DNS server is shared with other WG interfaces
+# If conflict, use Cloudflare DNS to avoid routing issues
+CONF_DIR="$(dirname "$CONFIG_FILE")"
+NEW_DNS=""
+for dns in $DNS_SERVERS; do
+    dns_conflict=0
+    for conf in "$CONF_DIR"/*.conf; do
+        [ "$conf" = "$CONFIG_FILE" ] && continue  # Skip self
+        [ ! -f "$conf" ] && continue
+        if grep -q "DNS.*$dns" "$conf" 2>/dev/null; then
+            dns_conflict=1
+            conflicting_iface=$(basename "$conf" .conf)
+            break
+        fi
+    done
+    
+    if [ "$dns_conflict" = "1" ]; then
+        case "$dns" in
+            *:*)
+                # IPv6 DNS conflict - use Cloudflare IPv6
+                log "Warning: DNS $dns shared with $conflicting_iface, using 2606:4700:4700::1111 instead"
+                NEW_DNS="$NEW_DNS 2606:4700:4700::1111"
+                ;;
+            *)
+                # IPv4 DNS conflict - use Cloudflare IPv4
+                log "Warning: DNS $dns shared with $conflicting_iface, using 1.1.1.1 instead"
+                NEW_DNS="$NEW_DNS 1.1.1.1"
+                ;;
+        esac
+    else
+        NEW_DNS="$NEW_DNS $dns"
+    fi
+done
+DNS_SERVERS=$(trim "$NEW_DNS")
+log "Using DNS servers: $DNS_SERVERS"
+
 # Detect IPv6 support based on config
 if [ -n "$CLIENT_IP6" ]; then
     IPV6_SUPPORTED=1
@@ -386,23 +423,9 @@ setup_pbr() {
         ip -6 rule add fwmark "$MARK" table "$ROUTING_TABLE" priority 50
     fi
     
-    # 2b. DNS Routing (Force Route) - Route shared DNS IPs via this interface
-    if [ -n "$DNS_SERVERS" ]; then
-        log "Routing DNS servers ($DNS_SERVERS) via $INTERFACE"
-        for dns in $DNS_SERVERS; do
-            # Check if it's IPv6
-            case "$dns" in
-                *:*) 
-                    ip -6 rule del to "$dns" table "$ROUTING_TABLE" 2>/dev/null || true
-                    ip -6 rule add to "$dns" table "$ROUTING_TABLE" priority 49
-                    ;;
-                *) 
-                    ip rule del to "$dns" table "$ROUTING_TABLE" 2>/dev/null || true
-                    ip rule add to "$dns" table "$ROUTING_TABLE" priority 49
-                    ;;
-            esac
-        done
-    fi
+    # 2b. DNS Routing - REMOVED destination-based rules (caused conflict when multiple interfaces share same DNS)
+    # DNS routing is now handled via fwmark in the split_chain below, which marks packets to the VPN's
+    # DNS servers with this interface's mark, then uses the existing fwmark routing rules.
     
     # 3. Mangle Chain Setup (always create IPv6 chain for DROP rules even if no IPv6 support)
     iptables -t mangle -N "$split_chain" 2>/dev/null || iptables -t mangle -F "$split_chain"
@@ -458,6 +481,37 @@ setup_pbr() {
         ip6tables -t mangle -A "$split_chain" -m mac --mac-source "$mac" -j RETURN
         log "Skipping VPN MAC: $mac (IPv6)"
     done
+    
+    # Step 0d: Mark DNS packets destined for THIS interface's DNS servers
+    # This uses fwmark instead of destination-based ip rules to avoid conflicts
+    # when multiple interfaces share the same DNS server IP
+    # We mark both PREROUTING (client traffic) and OUTPUT (router-originated DNS like dnsmasq)
+    if [ -n "$DNS_SERVERS" ]; then
+        log "Adding fwmark-based DNS routing for: $DNS_SERVERS"
+        for dns in $DNS_SERVERS; do
+            case "$dns" in
+                *:*)
+                    # IPv6 DNS
+                    if [ "$IPV6_SUPPORTED" = "1" ]; then
+                        # PREROUTING (client traffic)
+                        ip6tables -t mangle -A "$split_chain" -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                        ip6tables -t mangle -A "$split_chain" -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                        # OUTPUT (router-originated DNS, e.g. dnsmasq queries)
+                        ip6tables -t mangle -A OUTPUT -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                        ip6tables -t mangle -A OUTPUT -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                    fi
+                    ;;
+                *)
+                    # IPv4 DNS - PREROUTING (client traffic)
+                    iptables -t mangle -A "$split_chain" -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                    iptables -t mangle -A "$split_chain" -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                    # IPv4 DNS - OUTPUT (router-originated DNS, e.g. dnsmasq queries)
+                    iptables -t mangle -A OUTPUT -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                    iptables -t mangle -A OUTPUT -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                    ;;
+            esac
+        done
+    fi
     
     # Step 1: Mark packets matching destination ipset FIRST
     log "Adding global PBR rules for domains (all sources)"
