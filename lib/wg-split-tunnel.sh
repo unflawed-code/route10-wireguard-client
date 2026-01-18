@@ -447,22 +447,9 @@ setup_pbr() {
         ip6tables -t mangle -A "$split_chain" -i "$INTERFACE" -j RETURN
     fi
     
-    # Step 0a: Restore OUR mark from conntrack (for established connections)
-    # Only restore if connmark matches our specific mark (prevents restoring unrelated marks)
-    iptables -t mangle -A "$split_chain" -m connmark --mark "$MARK" -j CONNMARK --restore-mark
-    if [ "$IPV6_SUPPORTED" = "1" ]; then
-        ip6tables -t mangle -A "$split_chain" -m connmark --mark "$MARK" -j CONNMARK --restore-mark
-    fi
-    
-    # Step 0b: If packet already has our mark, ACCEPT it (skip further processing)
-    iptables -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
-    if [ "$IPV6_SUPPORTED" = "1" ]; then
-        ip6tables -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
-    fi
-    
-    # Step 0c: Skip packets from VPN-routed clients (source IP in vpn_* ipsets)
-    # This ensures split-tunnel only affects direct connection clients
-    # Note: We check source ipset rather than mark because mark chains run after this
+    # Step 0a: Skip packets from VPN-routed clients (source IP in vpn_* ipsets)
+    # This MUST come BEFORE connmark restore to prevent VPN clients from having
+    # a cached split-tunnel mark restored and routed incorrectly
     for vpn_set in $(ipset list -n | grep '^vpn_' | grep -v '^vpn6_'); do
         # Skip our own destination ipset (dst_vpn_*)
         case "$vpn_set" in dst_vpn_*) continue ;; esac
@@ -476,11 +463,24 @@ setup_pbr() {
         log "Skipping VPN ipset: $vpn_set (IPv6)"
     done
     # IPv6: Also skip by MAC address - wg-pbr.sh uses mark_ipv6_* chains with MAC matching
-    # Extract MACs from existing mark_ipv6_* chains and add RETURN rules
     for mac in $(ip6tables -t mangle -S 2>/dev/null | grep 'mark_ipv6_' | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | sort -u); do
         ip6tables -t mangle -A "$split_chain" -m mac --mac-source "$mac" -j RETURN
         log "Skipping VPN MAC: $mac (IPv6)"
     done
+    
+    # Step 0b: Restore OUR mark from conntrack (for established connections)
+    # Only restore if connmark matches our specific mark (prevents restoring unrelated marks)
+    # This comes AFTER VPN skip to prevent restoring marks for VPN clients
+    iptables -t mangle -A "$split_chain" -m connmark --mark "$MARK" -j CONNMARK --restore-mark
+    if [ "$IPV6_SUPPORTED" = "1" ]; then
+        ip6tables -t mangle -A "$split_chain" -m connmark --mark "$MARK" -j CONNMARK --restore-mark
+    fi
+    
+    # Step 0c: If packet already has our mark, ACCEPT it (skip further processing)
+    iptables -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
+    if [ "$IPV6_SUPPORTED" = "1" ]; then
+        ip6tables -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
+    fi
     
     # Step 0d: Mark DNS packets destined for THIS interface's DNS servers
     # This uses fwmark instead of destination-based ip rules to avoid conflicts

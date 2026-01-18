@@ -216,30 +216,21 @@ if [ "$1" = "commit" ]; then
         HOT_RELOAD_IFACES=""  # Track interfaces that only need target updates
         rm -f "${WG_TMP_DIR}/deferred_dhcp.tmp"  # Clean up from any previous run
         
-        # Process each staged interface from SQLite
+        # Process each staged interface from SQLite in TWO PASSES:
+        # Pass 1: Target-IP interfaces (no domains) - creates VPN ipsets first
+        # Pass 2: Split-tunnel interfaces (has domains) - can RETURN on VPN ipsets
         # Format: name|conf|routing_table|target_ips|committed|target_only|domains
+        
+        # === PASS 1: Target-IP interfaces ===
         echo "$staged_list" | while IFS='|' read -r iface conf rt targets committed target_only domains; do
             [ -z "$iface" ] && continue
+            
+            # Skip split-tunnel configs (has domains) - handled in pass 2
+            [ -n "$domains" ] && [ "$domains" != "" ] && continue
             
             # Convert SQLite integers to shell booleans
             [ "$committed" = "1" ] && committed="true" || committed="false"
             [ "$target_only" = "1" ] && target_only="true" || target_only="false"
-            
-            # Check if this is a split-tunnel config (has domains)
-            if [ -n "$domains" ] && [ "$domains" != "" ]; then
-                # Split-tunnel mode
-                if [ "$committed" != "true" ]; then
-                    echo "Applying split-tunnel for $iface (domains: $domains)..."
-                    if "$LIB_DIR/wg-split-tunnel.sh" "$iface" -c "$conf" -d "$domains" -r "$rt"; then
-                        db_commit_interface "$iface"
-                        db_set_running "$iface" 1
-                        echo "$iface" >> "${WG_TMP_DIR}/split_tunnel_ifaces.tmp"
-                    else
-                        echo "Error applying split-tunnel for $iface"
-                    fi
-                fi
-                continue
-            fi
             
             # Check if this is a target-only change for an already-committed interface
             if [ "$target_only" = "true" ] && [ "$committed" = "true" ]; then
@@ -260,6 +251,29 @@ if [ "$1" = "commit" ]; then
                     echo "$iface" >> "${WG_TMP_DIR}/new_ifaces.tmp"
                 else
                     echo "Error applying configuration for $iface"
+                fi
+            fi
+        done
+        
+        # === PASS 2: Split-tunnel interfaces (after VPN ipsets exist) ===
+        echo "$staged_list" | while IFS='|' read -r iface conf rt targets committed target_only domains; do
+            [ -z "$iface" ] && continue
+            
+            # Skip target-IP configs (no domains) - handled in pass 1
+            [ -z "$domains" ] || [ "$domains" = "" ] && continue
+            
+            # Convert SQLite integers to shell booleans
+            [ "$committed" = "1" ] && committed="true" || committed="false"
+            
+            # Split-tunnel mode
+            if [ "$committed" != "true" ]; then
+                echo "Applying split-tunnel for $iface (domains: $domains)..."
+                if "$LIB_DIR/wg-split-tunnel.sh" "$iface" -c "$conf" -d "$domains" -r "$rt"; then
+                    db_commit_interface "$iface"
+                    db_set_running "$iface" 1
+                    echo "$iface" >> "${WG_TMP_DIR}/split_tunnel_ifaces.tmp"
+                else
+                    echo "Error applying split-tunnel for $iface"
                 fi
             fi
         done
