@@ -2,7 +2,7 @@
 
 This project provides a robust, script-based solution for managing WireGuard interfaces on Route10 (OpenWrt based) routers, with a focus on Policy-Based Routing (PBR). It allows you to selectively route specific clients or subnets through different WireGuard tunnels while maintaining direct internet access for others.
 
-Tested on Route10 firmware version `1.4o`.
+Tested on Route10 firmware version `1.4p`.
 
 ## Key Features
 
@@ -28,11 +28,28 @@ Tested on Route10 firmware version `1.4o`.
 
 ## Installation & Setup
 
-1. **Clone/Copy Files**: Place the scripts in a persistent directory on your Route10 (`/cfg/` or any directories in it).
+1. **Clone/Copy & Configure**:
+    - Create a folder for the scripts (e.g., `/cfg/wg-pbr/`) and copy all files there.
+    - Copy `post-cfg-template.sh` to `/cfg/post-cfg.sh` to ensure it runs on boot.
+    - Edit `/cfg/post-cfg.sh` to correct the paths:
+
+        ```sh
+        CONF_DIR="/cfg/wg-pbr/conf"
+        WG_SCRIPT="/cfg/wg-pbr/wg-pbr.sh"
+        ```
+
+    - Define your interfaces in `/cfg/post-cfg.sh` by uncommenting and adapting the example lines:
+
+        ```sh
+        $WG_SCRIPT wg0 -c "$CONF_DIR/wg0.conf" -t '192.168.1.55'
+        $WG_SCRIPT wg1 -c "$CONF_DIR/wg1.conf" -r 100 -t '10.10.10.0/24'
+        ```
+
 2. **Make Executable**:
 
     ```sh
-    chmod 700 wg-pbr.sh post-cfg.sh
+    cd /cfg/wg-pbr/
+    chmod 700 wg-pbr.sh /cfg/post-cfg.sh lib/* plugins/*
     ```
 
 3. **Run the Script**:
@@ -58,9 +75,9 @@ Tested on Route10 firmware version `1.4o`.
 
     ```sh
     # Stage one or more configurations (routing table auto-allocated if -r not specified)
-    ./wg-pbr.sh wg0 -c /etc/wireguard/wg0.conf -t 192.168.1.55
-    ./wg-pbr.sh wg1 -c /etc/wireguard/wgx.conf -t 10.10.10.0/24
-    ./wg-pbr.sh wg2 -c /etc/wireguard/wgy.conf -r 120 -t 10.20.20.0/24,10.50.50.50
+    ./wg-pbr.sh wg0 -c /cfg/wg-pbr/conf/wg0.conf -t 192.168.1.55
+    ./wg-pbr.sh wg1 -c /cfg/wg-pbr/conf/wgx.conf -t 10.10.10.0/24
+    ./wg-pbr.sh wg2 -c /cfg/wg-pbr/conf/wgy.conf -r 120 -t 10.20.20.0/24,10.50.50.50
 
     # Apply all staged configurations
     ./wg-pbr.sh commit
@@ -68,21 +85,7 @@ Tested on Route10 firmware version `1.4o`.
     # Hot-reload: Move a client between interfaces without restarting tunnels
     ./wg-pbr.sh assign-ips wg1 192.168.1.55   # Automatically removes from wg0
     ./wg-pbr.sh commit                        # Updates routing instantly, no tunnel restart
-
-    # Split-Tunnel (Domain-based): Route specific domains through VPN
-    ./wg-pbr.sh wg0 -c /etc/wireguard/wg0.conf -d "whatismyipaddress.com,ipleak.net"
     ```
-
-4. **Configure After Boot (Optional)**:
-    - Copy `post-cfg-template.sh` to `post-cfg.sh` (if not already done).
-    - Edit `post-cfg.sh` to correct the paths:
-
-        ```sh
-        CONF_DIR="/path/to/your/wg/conf/files"
-        WG_PBR_SCRIPT="/path/to/wg-pbr.sh"
-        ```
-
-    - Define your interfaces in `post-cfg.sh` using the `setup_interface` function.
 
 ## Domain-Based Split Tunneling
 
@@ -91,7 +94,7 @@ Instead of routing specific clients *through* the VPN, you can route specific *d
 ### Usage
 
 ```sh
-./wg-pbr.sh wg0 -c /cfg/wgx.conf -d "whatismyipaddress.com,ipleak.net"
+./wg-pbr.sh wg0 -c /cfg/wg-pbr/conf/wgx.conf -d "whatismyipaddress.com,ipleak.net"
 ```
 
 ### How It Works
