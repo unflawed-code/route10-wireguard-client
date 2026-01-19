@@ -2,7 +2,7 @@
 
 This project provides a robust, script-based solution for managing WireGuard interfaces on Route10 (OpenWrt based) routers, with a focus on Policy-Based Routing (PBR). It allows you to selectively route specific clients or subnets through different WireGuard tunnels while maintaining direct internet access for others.
 
-Tested on Route10 firmware version `1.4o`.
+Tested on Route10 firmware version `1.4p`.
 
 ## Key Features
 

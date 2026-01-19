@@ -248,7 +248,7 @@ if [ "$1" = "commit" ]; then
         fi
         
         # Configure dnsmasq to use the hook if not already set
-        current_hook=$(uci -q get dhcp.@dnsmasq[0].dhcpscript)
+        current_hook=$(uci -q get dhcp.@dnsmasq[0].dhcpscript || true)
         if [ "$current_hook" != "$DHCP_HOOK" ]; then
             echo "Configuring dnsmasq to use DHCP hook..."
             uci set dhcp.@dnsmasq[0].dhcpscript="$DHCP_HOOK"
@@ -371,7 +371,7 @@ fi
 
 if [ -z "$ROUTING_TABLE_OVERRIDE" ]; then
     # Auto-allocate from 100-199 range
-    ROUTING_TABLE_OVERRIDE=$(allocate_routing_table)
+    ROUTING_TABLE_OVERRIDE=$(allocate_routing_table || true)
     if [ -z "$ROUTING_TABLE_OVERRIDE" ]; then
         echo "Error: Could not allocate routing table (100-199 range exhausted)"
         echo "Use -r <number> to specify your own routing table value"
