@@ -1,0 +1,51 @@
+#!/bin/sh
+# Auto-generated hotplug script for split-tunnel interface: INTERFACE_PLACEHOLDER
+# This script is called by OpenWrt's hotplug system when the interface state changes
+
+[ "$ACTION" = "ifup" -a "$INTERFACE" = "INTERFACE_PLACEHOLDER" ] && {
+    logger -t wg-split-tunnel "[INTERFACE_PLACEHOLDER] Interface up, re-applying split-tunnel configuration"
+    
+    # Re-run the split-tunnel setup script
+    /cfg/wg-custom/lib/wg-split-tunnel.sh \
+        --interface "INTERFACE_PLACEHOLDER" \
+        --config "CONFIG_FILE_PLACEHOLDER" \
+        --table ROUTING_TABLE_PLACEHOLDER \
+        --domains "DOMAINS_PLACEHOLDER"
+    
+    exit 0
+}
+
+[ "$ACTION" = "ifdown" -a "$INTERFACE" = "INTERFACE_PLACEHOLDER" ] && {
+    logger -t wg-split-tunnel "[INTERFACE_PLACEHOLDER] Interface down, cleaning up"
+    
+    # Kill dedicated dnsmasq
+    DEDICATED_PID="/tmp/wg-custom/INTERFACE_PLACEHOLDER-split-dnsmasq.pid"
+    if [ -f "$DEDICATED_PID" ]; then
+        kill "$(cat "$DEDICATED_PID")" 2>/dev/null || true
+        rm -f "$DEDICATED_PID"
+    fi
+    
+    # Clean up firewall chains
+    SPLIT_CHAIN="split_INTERFACE_PLACEHOLDER"
+    iptables -t mangle -F "$SPLIT_CHAIN" 2>/dev/null || true
+    iptables -t mangle -X "$SPLIT_CHAIN" 2>/dev/null || true
+    ip6tables -t mangle -F "$SPLIT_CHAIN" 2>/dev/null || true
+    ip6tables -t mangle -X "$SPLIT_CHAIN" 2>/dev/null || true
+    
+    # Remove from PREROUTING
+    iptables -t mangle -D PREROUTING -j "$SPLIT_CHAIN" 2>/dev/null || true
+    ip6tables -t mangle -D PREROUTING -j "$SPLIT_CHAIN" 2>/dev/null || true
+    
+    # Remove IP rules
+    MARK_PLACEHOLDER="MARK_PLACEHOLDER"
+    TABLE="ROUTING_TABLE_PLACEHOLDER"
+    ip rule del fwmark "$MARK_PLACEHOLDER" table "$TABLE" 2>/dev/null || true
+    ip -6 rule del fwmark "$MARK_PLACEHOLDER" table "$TABLE" 2>/dev/null || true
+    
+    # Remove dnsmasq stub config
+    rm -f "/tmp/dnsmasq.d/INTERFACE_PLACEHOLDER-split-stub.conf"
+    /etc/init.d/dnsmasq reload
+    
+    logger -t wg-split-tunnel "[INTERFACE_PLACEHOLDER] Cleanup complete"
+    exit 0
+}

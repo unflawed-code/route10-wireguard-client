@@ -12,9 +12,19 @@ discover_interfaces() {
     sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE committed = 1 ORDER BY name;" 2>/dev/null
 }
 
+# Discover IP-routing capable interfaces (those without domains configured)
+discover_ip_routing_interfaces() {
+    # Only interfaces with NULL or empty domains support IP routing (assign-ips)
+    sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE committed = 1 AND (domains IS NULL OR domains = '') ORDER BY name;" 2>/dev/null
+}
+
 # Get interface count
 RUNNING_IFACES=$(discover_interfaces)
 IFACE_COUNT=$(echo "$RUNNING_IFACES" | grep -c .)
+
+# Get IP-routing capable interfaces for movement tests
+IP_ROUTING_IFACES=$(discover_ip_routing_interfaces)
+IP_ROUTING_COUNT=$(echo "$IP_ROUTING_IFACES" | grep -c . 2>/dev/null || echo "0")
 
 echo "=========================================="
 echo " WireGuard Interface Detection"
@@ -27,19 +37,20 @@ if [ "$IFACE_COUNT" -eq 0 ]; then
     exit 1
 fi
 
-# Assign discovered interfaces to variables
-IFACE_A=$(echo "$RUNNING_IFACES" | sed -n '1p')
-IFACE_B=$(echo "$RUNNING_IFACES" | sed -n '2p')
+# For movement tests, use IP-routing capable interfaces only
+IFACE_A=$(echo "$IP_ROUTING_IFACES" | sed -n '1p')
+IFACE_B=$(echo "$IP_ROUTING_IFACES" | sed -n '2p')
 
-# Find an interface with IPv6 support from SQLite
+# Find an interface with IPv6 support from SQLite (must also be IP-routing capable)
 IFACE_IPV6=""
 IFACE_IPV4_ONLY=""
-IFACE_IPV6=$(sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE ipv6_support = 1 LIMIT 1;" 2>/dev/null)
-IFACE_IPV4_ONLY=$(sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE ipv6_support = 0 OR ipv6_support IS NULL LIMIT 1;" 2>/dev/null)
+IFACE_IPV6=$(sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE ipv6_support = 1 AND (domains IS NULL OR domains = '') LIMIT 1;" 2>/dev/null)
+IFACE_IPV4_ONLY=$(sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE (ipv6_support = 0 OR ipv6_support IS NULL) AND (domains IS NULL OR domains = '') LIMIT 1;" 2>/dev/null)
 
 log_info "Found $IFACE_COUNT running interface(s)"
-log_info "Primary interface: $IFACE_A"
-[ -n "$IFACE_B" ] && log_info "Secondary interface: $IFACE_B"
+log_info "Found $IP_ROUTING_COUNT IP-routing capable interface(s)"
+log_info "Primary interface (IP routing): $IFACE_A"
+[ -n "$IFACE_B" ] && log_info "Secondary interface (IP routing): $IFACE_B"
 [ -n "$IFACE_IPV6" ] && log_info "IPv6-enabled interface: $IFACE_IPV6"
 [ -n "$IFACE_IPV4_ONLY" ] && log_info "IPv4-only interface: $IFACE_IPV4_ONLY"
 echo ""
@@ -49,13 +60,6 @@ TEST_IFACE="wgtest_ips"
 TEST_IP1="10.99.0.1"
 TEST_IP2="10.99.0.2"
 TEST_SUBNET="10.99.1.0/24"
-
-cleanup() {
-    log_info "Cleaning up test interface..."
-    # Remove test interface from SQLite database
-    sqlite3 "$WG_DB" "DELETE FROM interfaces WHERE name = '${TEST_IFACE}';" 2>/dev/null
-    rm -f "$TEST_CONF" 2>/dev/null
-}
 
 # Helper to get staged targets for an interface from SQLite
 get_staged_targets() {
@@ -70,8 +74,23 @@ interface_exists() {
     [ "$count" -gt 0 ]
 }
 
-# Run cleanup at start
-cleanup
+cleanup_all() {
+    log_info "Running cleanup..."
+    # Remove all test interfaces from SQLite database
+    sqlite3 "$WG_DB" "DELETE FROM interfaces WHERE name IN ('${TEST_IFACE}', '${TEST_SPLIT_IFACE:-wgtsplit}');" 2>/dev/null
+    
+    # Remove test config file
+    rm -f "$TEST_CONF" 2>/dev/null
+    
+    # Remove temporary cleanup script if it exists
+    rm -f /tmp/cleanup_test.sql 2>/dev/null
+}
+
+# Register cleanup trap
+trap cleanup_all EXIT INT TERM
+
+# Run cleanup at start to ensure clean state
+cleanup_all
 
 # Create dummy WireGuard config for testing
 cat > "$TEST_CONF" << 'EOF'
@@ -271,10 +290,10 @@ echo " Testing IP Movement Between Interfaces"
 echo "=========================================="
 echo ""
 
-# For movement tests, we need two running interfaces
+# For movement tests, we need two IP-routing capable interfaces 
 if [ -z "$IFACE_B" ]; then
-    log_skip "Movement tests require 2 running interfaces (only 1 found)"
-    log_skip "Skipping tests 16-20"
+    log_skip "Movement tests require 2 IP-routing capable interfaces (found $IP_ROUTING_COUNT)"
+    log_skip "Skipping tests 16-24 (split-tunnel interfaces don't support assign-ips)"
 else
     MOVE_IFACE_A="$IFACE_A"
     MOVE_IFACE_B="$IFACE_B"
@@ -588,6 +607,45 @@ else
     log_info "Cleaning up IPv6 test IP..."
     ./wg-pbr.sh remove-ips "$IFACE_IPV6" "$IPV6_TEST_IP" > /dev/null 2>&1
     ./wg-pbr.sh commit > /dev/null 2>&1
+fi
+
+# --- Test: Verify assign-ips fails for split-tunnel interface ---
+echo ""
+echo "=========================================="
+echo " Testing Split-Tunnel Exclusions"
+echo "=========================================="
+echo ""
+
+TEST_SPLIT_IFACE="wgtsplit"
+# Use same test conf
+log_info "Staging split-tunnel interface $TEST_SPLIT_IFACE..."
+./wg-pbr.sh "$TEST_SPLIT_IFACE" --conf "$TEST_CONF" -d "example.com" > /dev/null 2>&1
+
+if interface_exists "$TEST_SPLIT_IFACE"; then
+    log_pass "Split-tunnel interface staged"
+    
+    # Try to assign IP - SHOULD FAIL
+    log_info "Attempting to assign IP to split-tunnel interface (should fail)..."
+    if ./wg-pbr.sh assign-ips "$TEST_SPLIT_IFACE" "10.200.200.1" > /dev/null 2>&1; then
+        log_fail "assign-ips succeeded on split-tunnel interface (should be blocked)"
+    else
+        log_pass "assign-ips blocked on split-tunnel interface (correct)"
+    fi
+    
+    # Try to remove IP - SHOULD FAIL (though technically harmless, semantic block)
+    # The script blocks both target management commands for split-tunnel mode
+    log_info "Attempting to remove IP from split-tunnel interface (should fail)..."
+    if ./wg-pbr.sh remove-ips "$TEST_SPLIT_IFACE" "10.200.200.1" > /dev/null 2>&1; then
+        log_fail "remove-ips succeeded on split-tunnel interface (should be blocked)"
+    else
+        log_pass "remove-ips blocked on split-tunnel interface (correct)"
+    fi
+    
+    # Cleanup split interface
+    log_info "Cleaning up split-tunnel test interface..."
+    sqlite3 "$WG_DB" "DELETE FROM interfaces WHERE name = '${TEST_SPLIT_IFACE}';" 2>/dev/null
+else
+    log_fail "Failed to stage split-tunnel interface for testing"
 fi
 
 # --- Final Cleanup ---

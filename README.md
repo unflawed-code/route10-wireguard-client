@@ -12,6 +12,7 @@ Tested on Route10 firmware version `1.4p`.
 | Internet Kill Switch (IPv4/IPv6) :shield: | Ensures that traffic designated for the VPN is blocked if the tunnel is down. |
 | IPv6 Leak Prevention :droplet: | Prevents IPv6 traffic from bypassing the VPN tunnel via the default WAN gateway. |
 | IPv4/IPv6 DNS Leak Protection :droplet: | Redirects DNS queries through the VPN to prevent leaks to ISP or public DNS servers. |
+| Split Tunneling (Domain-based) | Route specific domains through VPN, clients already routed to another VPN are unaffected. |
 | Plugin Architecture | Extensible via hook scripts in `plugins/`. |
 
 ## Core Scripts
@@ -27,21 +28,39 @@ Tested on Route10 firmware version `1.4p`.
 
 ## Installation & Setup
 
-1. **Clone/Copy Files**: Place the scripts in a persistent directory on your Route10 (`/cfg/` or any directories in it).
+1. **Clone/Copy & Configure**:
+    - Create a folder for the scripts (e.g., `/cfg/wg-pbr/`) and copy all files there.
+    - Copy `post-cfg-template.sh` to `/cfg/post-cfg.sh` to ensure it runs on boot.
+    - Edit `/cfg/post-cfg.sh` to correct the paths:
+
+        ```sh
+        CONF_DIR="/cfg/wg-pbr/conf"
+        WG_SCRIPT="/cfg/wg-pbr/wg-pbr.sh"
+        ```
+
+    - Define your interfaces in `/cfg/post-cfg.sh` by uncommenting and adapting the example lines:
+
+        ```sh
+        $WG_SCRIPT wg0 -c "$CONF_DIR/wg0.conf" -t '192.168.1.55'
+        $WG_SCRIPT wg1 -c "$CONF_DIR/wg1.conf" -r 100 -t '10.10.10.0/24'
+        ```
+
 2. **Make Executable**:
 
     ```sh
-    chmod 700 wg-pbr.sh post-cfg.sh
+    cd /cfg/wg-pbr/
+    chmod 700 wg-pbr.sh /cfg/post-cfg.sh lib/* plugins/*
     ```
 
 3. **Run the Script**:
 
     ```sh
-    Usage: ./wg-pbr.sh <interface_name> -c <config_file> [-t <IPs_comma_separated>] [-r <routing_table>]
+    Usage: ./wg-pbr.sh <interface_name> -c <config_file> [ -t <IPs> [-r <routing_table>] | -d <domains> ]
       Arguments for configuration:
         <interface_name>:   WireGuard interface name (max 11 chars)
         -c, --conf <file>:      Relative or absolute path to the wg conf file
         -t, --target-ips <IPs>:  (Optional) Comma-separated list of IPv4 addresses/subnets
+        -d, --domains <domains>: (Optional) Comma-separated list of domains for split-tunnel (incompatible with -t/-r)
         -r, --routing-table <N>: (Optional) Routing table number, auto-allocated 100-199 if not provided
 
     Commands:
@@ -56,9 +75,9 @@ Tested on Route10 firmware version `1.4p`.
 
     ```sh
     # Stage one or more configurations (routing table auto-allocated if -r not specified)
-    ./wg-pbr.sh wg0 -c /etc/wireguard/wg0.conf -t 192.168.1.55
-    ./wg-pbr.sh wg1 -c /etc/wireguard/wgx.conf -t 10.10.10.0/24
-    ./wg-pbr.sh wg2 -c /etc/wireguard/wgy.conf -r 120 -t 10.20.20.0/24,10.50.50.50
+    ./wg-pbr.sh wg0 -c /cfg/wg-pbr/conf/wg0.conf -t 192.168.1.55
+    ./wg-pbr.sh wg1 -c /cfg/wg-pbr/conf/wgx.conf -t 10.10.10.0/24
+    ./wg-pbr.sh wg2 -c /cfg/wg-pbr/conf/wgy.conf -r 120 -t 10.20.20.0/24,10.50.50.50
 
     # Apply all staged configurations
     ./wg-pbr.sh commit
@@ -68,16 +87,30 @@ Tested on Route10 firmware version `1.4p`.
     ./wg-pbr.sh commit                        # Updates routing instantly, no tunnel restart
     ```
 
-4. **Configure After Boot (Optional)**:
-    - Copy `post-cfg-template.sh` to `post-cfg.sh` (if not already done).
-    - Edit `post-cfg.sh` to correct the paths:
+## Domain-Based Split Tunneling
 
-        ```sh
-        CONF_DIR="/path/to/your/wg/conf/files"
-        WG_PBR_SCRIPT="/path/to/wg-pbr.sh"
-        ```
+Instead of routing specific clients *through* the VPN, you can route specific *domains* through the VPN for all clients, while keeping the rest of the traffic on the default gateway. Clients already routed to another VPN are not affected.
 
-    - Define your interfaces in `post-cfg.sh` using the `setup_interface` function.
+### Usage
+
+```sh
+./wg-pbr.sh wg0 -c /cfg/wg-pbr/conf/wgx.conf -d "whatismyipaddress.com,ipleak.net"
+```
+
+### How It Works
+
+1. **dnsmasq & ipset**: The script configures `dnsmasq` to intercept DNS queries for the specified domains.
+2. **Dynamic Routing**: When a domain is resolved, the resulting IP addresses are added to an `ipset`.
+3. **Policy Routing**: Traffic to these IPs is marked and routed through the WireGuard tunnel.
+4. **Auto-Restart**: `dnsmasq` is automatically restarted during `commit` to ensure ipsets are populated correctly.
+
+### Important Notes
+
+- **Exclusive Mode**: Split-tunneling (`-d`) cannot be combined with IP-based routing (`-t`) or custom table assignment (`-r`). The interface is dedicated to routing these domains.
+- **IPv6 Behavior**:
+  - **If VPN supports IPv6**: Both IPv4 and IPv6 traffic to the domains are routed through the tunnel.
+  - **If VPN is IPv4-only**: IPv4 traffic is routed, but IPv6 traffic to the domains is **blocked** (DROP) to prevent leaks.
+- **DNS Handling**: The router's DNS must be set to `dnsmasq` (default OpenWrt behavior) for this to work.
 
 ## IPv6 Handling
 

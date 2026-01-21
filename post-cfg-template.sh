@@ -13,6 +13,5 @@ WG_SCRIPT="/path/to/wg-pbr.sh"
 # --- End of WireGuard Configuration ---
 
 $WG_SCRIPT commit
-$WG_SCRIPT reapply
 
 exit 0

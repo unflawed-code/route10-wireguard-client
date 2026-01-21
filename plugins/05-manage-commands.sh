@@ -36,14 +36,14 @@ handle_command() {
             return 0
             ;;
         remove-ips)
-            [ -z "$2" ] || [ -z "$3" ] && echo "Error: remove-ips requires interface and IP(s)" && return 0
+            [ -z "$2" ] || [ -z "$3" ] && echo "Error: remove-ips requires interface and IP(s)" && return 1
             cmd_remove_ip "$2" "$3"
-            return 0
+            return $?
             ;;
         assign-ips)
-            [ -z "$2" ] || [ -z "$3" ] && echo "Error: assign-ips requires interface and IP(s)" && return 0
+            [ -z "$2" ] || [ -z "$3" ] && echo "Error: assign-ips requires interface and IP(s)" && return 1
             cmd_assign_ip "$2" "$3"
-            return 0
+            return $?
             ;;
     esac
     return 1
@@ -152,10 +152,18 @@ cmd_status() {
         local conf=$(echo "$db_entry" | cut -d'|' -f2)
         
         echo "Routing Table: $rt (${iface}_rt)"
-        if [ -n "$vpn_ips" ] && [ "$vpn_ips" != "" ] && [ "$vpn_ips" != "none" ]; then
-            echo "Target IPs:    $(echo $vpn_ips | tr ',' ' ')"
+        
+        # Check if this is a split-tunnel interface
+        local domains=$(echo "$db_entry" | cut -d'|' -f5)
+        if [ -n "$domains" ] && [ "$domains" != "" ]; then
+            echo "Mode:          Split-Tunnel"
+            echo "Domains:       $domains"
         else
-            echo "Target IPs:    (No targets)"
+            if [ -n "$vpn_ips" ] && [ "$vpn_ips" != "" ] && [ "$vpn_ips" != "none" ]; then
+                echo "Target IPs:    $(echo $vpn_ips | tr ',' ' ')"
+            else
+                echo "Target IPs:    (No targets)"
+            fi
         fi
         echo "IPv6 Support:  $([ "$ipv6" = "1" ] && echo "Yes" || echo "No")"
         [ -n "$ip6_subs" ] && [ "$ip6_subs" != "" ] && echo "IPv6 Subnets:  $ip6_subs"
@@ -219,6 +227,15 @@ cmd_remove_ip() {
         return 1
     fi
     
+    # Check if this is a split-tunnel interface (has domains)
+    local db_entry=$(db_get_interface "$iface" 2>/dev/null)
+    local domains=$(echo "$db_entry" | cut -d'|' -f5)
+    if [ -n "$domains" ] && [ "$domains" != "" ]; then
+        echo "Error: Cannot remove IPs from split-tunnel interface $iface"
+        echo "Split-tunnel routes by domain, not client IP."
+        return 1
+    fi
+    
     # Parse: name|conf|routing_table|target_ips|committed|target_only
     local current_targets=$(echo "$staged_entry" | cut -d'|' -f4 | tr ',' ' ')
     
@@ -268,6 +285,15 @@ cmd_assign_ip() {
     local staged_entry=$(db_get_staged "$iface" 2>/dev/null)
     if [ -z "$staged_entry" ]; then
         echo "Error: Interface $iface not found in database"
+        return 1
+    fi
+    
+    # Check if this is a split-tunnel interface (has domains)
+    local db_entry=$(db_get_interface "$iface" 2>/dev/null)
+    local domains=$(echo "$db_entry" | cut -d'|' -f5)
+    if [ -n "$domains" ] && [ "$domains" != "" ]; then
+        echo "Error: Cannot assign IPs to split-tunnel interface $iface"
+        echo "Split-tunnel routes by domain, not client IP."
         return 1
     fi
     
