@@ -82,6 +82,47 @@ start_test "trim (none)"
 result=$(trim "clean")
 assert_eq "clean" "$result"
 
+# --- Test is_mac() ---
+start_test "is_mac (colon format)"
+assert_true is_mac "2a:30:12:ef:5a:aa"
+
+start_test "is_mac (dash format)"
+assert_true is_mac "2a-30-12-ef-5a-aa"
+
+start_test "is_mac (no separator)"
+assert_true is_mac "2a3012ef5aaa"
+
+start_test "is_mac (uppercase)"
+assert_true is_mac "2A:30:12:EF:5A:AA"
+
+start_test "is_mac (invalid - too short)"
+assert_false is_mac "2a:30:12:ef:5a"
+
+start_test "is_mac (invalid - IP address)"
+assert_false is_mac "192.168.1.1"
+
+# --- Test normalize_mac() ---
+start_test "normalize_mac (colon format)"
+result=$(normalize_mac "2a:30:12:ef:5a:aa")
+assert_eq "2a:30:12:ef:5a:aa" "$result"
+
+start_test "normalize_mac (dash format)"
+result=$(normalize_mac "2A-30-12-EF-5A-AA")
+assert_eq "2a:30:12:ef:5a:aa" "$result"
+
+start_test "normalize_mac (no separator)"
+result=$(normalize_mac "2A3012EF5AAA")
+assert_eq "2a:30:12:ef:5a:aa" "$result"
+
+start_test "normalize_mac (invalid)"
+if normalize_mac "invalid" >/dev/null 2>&1; then
+    echo "${RED}FAIL${NC} (should have returned error)"
+    fail_count=$((fail_count + 1))
+else
+    echo "${GREEN}PASS${NC}"
+    pass_count=$((pass_count + 1))
+fi
+
 # --- Test ip_to_int() ---
 start_test "ip_to_int (0.0.0.0)"
 result=$(ip_to_int "0.0.0.0")
@@ -101,6 +142,19 @@ result=$(ip_to_int "192.168.1.1")
 # Let's assume the router environment. But here we can just test if it returns *something* consistent.
 # Let's test checking simple reconstruction.
 assert_eq "3232235777" "$result"
+
+# --- Test get_ip_from_target() ---
+start_test "get_ip_from_target (plain IP)"
+result=$(get_ip_from_target "1.2.3.4")
+assert_eq "1.2.3.4" "$result"
+
+start_test "get_ip_from_target (CIDR)"
+result=$(get_ip_from_target "10.0.0.0/24")
+assert_eq "10.0.0.0/24" "$result"
+
+start_test "get_ip_from_target (MAC=IP format)"
+result=$(get_ip_from_target "aa:bb:cc:dd:ee:ff=10.99.1.1")
+assert_eq "10.99.1.1" "$result"
 
 # --- Test is_in_subnet() ---
 start_test "is_in_subnet (192.168.1.5 in 192.168.1.0/24)"
@@ -124,6 +178,12 @@ assert_true is_in_list "192.168.50.99" "10.0.0.0/8 192.168.50.0/24"
 
 start_test "is_in_list (no match)"
 assert_false is_in_list "1.1.1.1" "2.2.2.2 3.3.3.3"
+
+start_test "is_in_list (MAC=IP exact match)"
+assert_true is_in_list "10.90.1.5" "10.90.1.1 aa:bb:cc:dd:ee:ff=10.90.1.5 10.90.1.10"
+
+start_test "is_in_list (MAC=IP no match)"
+assert_false is_in_list "10.90.1.6" "10.90.1.1 aa:bb:cc:dd:ee:ff=10.90.1.5 10.90.1.10"
 
 # --- Test get_lan_ifaces() ---
 start_test "get_lan_ifaces"

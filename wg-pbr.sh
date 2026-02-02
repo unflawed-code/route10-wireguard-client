@@ -11,7 +11,7 @@
 # - Persistent state management across reboots
 #
 
-WG_VERSION="v2.3.0"
+WG_VERSION="v2.4.0"
 export WG_VERSION
 
 set -e
@@ -36,7 +36,7 @@ usage() {
     echo "  Arguments for configuration:"
     echo "    <interface_name>:   WireGuard interface name (max 11 chars)"
     echo "    -c, --conf <file>:      Relative or absolute path to the wg conf file"
-    echo "    -t, --target-ips <IPs>:  Comma-separated list of IPv4 addresses/subnets (optional)"
+    echo "    -t, --target-ips <IPs>: Comma-separated list of IPv4 addresses/subnets/MACs"
     echo "    -r, --routing-table <N>: (Optional) Routing table number, auto-allocated 100-599 if not provided"
     echo "    -d, --domains <domains>: Comma-separated domains for split-tunnel (incompatible with -t/-r)"
     echo ""
@@ -308,9 +308,15 @@ if [ "$1" = "commit" ]; then
         
         # Trigger deferred DHCP re-processing (read from temp file to survive subshell)
         if [ -f "${WG_TMP_DIR}/deferred_dhcp.tmp" ]; then
-            for dhcp_ip in $(cat "${WG_TMP_DIR}/deferred_dhcp.tmp" | sort -u); do
-                dhcp_mac=$(ip neigh show | grep "^${dhcp_ip} " | awk '{print $5}' | head -1)
-                if [ -n "$dhcp_mac" ] && [ -f "$MASTER_DHCP_HOTPLUG" ]; then
+            for target in $(cat "${WG_TMP_DIR}/deferred_dhcp.tmp" | sort -u); do
+                dhcp_ip=$(get_ip_from_target "$target")
+                dhcp_mac=""
+                case "$target" in
+                    *=*) dhcp_mac="${target%%=*}" ;;
+                    *)   dhcp_mac=$(ip neigh show | grep "^${dhcp_ip} " | awk '{print $5}' | head -1) ;;
+                esac
+
+                if [ -n "$dhcp_mac" ] && [ "$dhcp_mac" != "<incomplete>" ] && [ -f "$MASTER_DHCP_HOTPLUG" ]; then
                     echo "Processing DHCP for $dhcp_ip ($dhcp_mac)"
                     MACADDR="$dhcp_mac" IPADDR="$dhcp_ip" ACTION="add" "$MASTER_DHCP_HOTPLUG" || true
                 fi
@@ -626,6 +632,50 @@ ROUTING_TABLE_NAME="${INTERFACE_NAME}_rt"
 # Set VPN_IPS from the required CLI parameter
 # Convert comma-separated string to space-separated list
 VPN_IPS=$(echo "$VPN_IPS_OVERRIDE" | sed 's/,/ /g' | tr -s ' ')
+
+# Resolve MAC addresses to IPs and check for conflicts
+RESOLVED_VPN_IPS=""
+for target in $VPN_IPS; do
+    original_target="$target"
+    
+    # Resolve MAC to IP if needed
+    if is_mac "$target"; then
+        mac=$(normalize_mac "$target")
+        resolved_ip=$(resolve_mac_to_ip "$mac")
+        if [ -z "$resolved_ip" ]; then
+            echo "WARN: MAC $mac not found in ARP table, skipping"
+            continue
+        fi
+        echo "Resolved MAC $mac -> $resolved_ip"
+        target="$resolved_ip"
+    fi
+    
+    # Skip IPv6 and subnets for conflict check (only single IPs)
+    case "$target" in
+        *:*|*/*) 
+            RESOLVED_VPN_IPS="$RESOLVED_VPN_IPS $target"
+            continue
+            ;;
+    esac
+    
+    # Conflict detection: first-setup-wins
+    existing_owner=$(db_find_interface_by_ip "$target" 2>/dev/null | head -1)
+    if [ -n "$existing_owner" ] && [ "$existing_owner" != "$INTERFACE_NAME" ]; then
+        echo "WARN: $target already routed via $existing_owner (first-setup-wins), skipping"
+        continue
+    fi
+    
+    # Deduplicate: skip if already in resolved list (e.g., both IP and MAC for same device)
+    if echo "$RESOLVED_VPN_IPS" | grep -qw "$target"; then
+        echo "INFO: $target already in target list (duplicate), skipping"
+        continue
+    fi
+    
+    RESOLVED_VPN_IPS="$RESOLVED_VPN_IPS $target"
+done
+VPN_IPS=$(echo "$RESOLVED_VPN_IPS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+[ -z "$VPN_IPS" ] && VPN_IPS="none"
+
 echo "Using Target IPs: $VPN_IPS (from --target-ips)"
 
 # --- END VARIABLE OVERRIDE ---
@@ -800,6 +850,7 @@ rm -f /etc/hotplug.d/iface/99-${INTERFACE_NAME}-cleanup 2>/dev/null
     uci set firewall.${INTERFACE_NAME}_fwd=forwarding
     uci set firewall.${INTERFACE_NAME}_fwd.src='lan'
     uci set firewall.${INTERFACE_NAME}_fwd.dest="$ZONE_NAME"
+    uci set firewall.${INTERFACE_NAME}_zone.mtu_fix='1'
 
 echo "Configuring policy-based routing..."
 if ! grep -q "^$ROUTING_TABLE[[:space:]]*$ROUTING_TABLE_NAME" /etc/iproute2/rt_tables 2>/dev/null; then
@@ -960,10 +1011,10 @@ setup_secure_dns() {
     # IPv4 DNS DNAT + Filtering
     if [ -n "$vpn_dns_v4" ]; then
         # Filter VPN_IPS for IPv4 only
-        local vpn_ips_v4=""
-        for item in $vpn_ips; do
-            if ! echo "$item" | grep -q ":"; then
-                vpn_ips_v4="$vpn_ips_v4 $item"
+        for target in $vpn_ips; do
+            actual_ip=$(get_ip_from_target "$target")
+            if ! echo "$actual_ip" | grep -q ":"; then
+                vpn_ips_v4="$vpn_ips_v4 $actual_ip"
             fi
         done
 
@@ -1002,9 +1053,10 @@ setup_secure_dns() {
     if [ -n "$vpn_dns_v6" ] && [ "$IPV6_SUPPORTED" = "1" ]; then
         # Filter VPN_IPS for IPv6 only and add routable subnets
         local vpn_ips_v6=""
-        for item in $vpn_ips; do
-            if echo "$item" | grep -q ":"; then
-                vpn_ips_v6="$vpn_ips_v6 $item"
+        for target in $vpn_ips; do
+            actual_ip=$(get_ip_from_target "$target")
+            if echo "$actual_ip" | grep -q ":"; then
+                vpn_ips_v6="$vpn_ips_v6 $actual_ip"
             fi
         done
         # Append routable subnets
@@ -1246,15 +1298,16 @@ if [ "$IPV6_SUPPORTED" = "1" ]; then
     DHCP_LEASE_FILE=$(get_dhcp_lease_file)
 
 if [ "$VPN_IPS" != "none" ]; then
-    for item in $VPN_IPS; do
-        case "$item" in
+    for target in $VPN_IPS; do
+        actual_ip=$(get_ip_from_target "$target")
+        case "$actual_ip" in
             */*) # Subnet
                 # Skip IPv6 subnets - is_in_subnet is IPv4-only. We only mark MACs from user config which are usually IPv4 subnets/IPs.
-                echo "$item" | grep -q ":" && continue
+                echo "$actual_ip" | grep -q ":" && continue
                 # Scan DHCP leases for clients in this subnet
                 if [ -n "$DHCP_LEASE_FILE" ]; then
                     while read -r exp mac ip host; do
-                        if is_in_subnet "$ip" "$item" && ! echo "$PROCESSED_MACS_V6" | grep -q "$mac"; then
+                        if is_in_subnet "$ip" "$actual_ip" && ! echo "$PROCESSED_MACS_V6" | grep -q "$mac"; then
                             PROCESSED_MACS_V6="$PROCESSED_MACS_V6 $mac"
                             logger -t wireguard "[$WG_INTERFACE] Marking IPv6 traffic from $ip ($mac) for VPN routing"
                             # Mark ALL IPv6 packets from this MAC with the routing mark
@@ -1268,7 +1321,7 @@ if [ "$VPN_IPS" != "none" ]; then
                 while read -r line; do
                     ip=$(echo $line | awk '{print $1}')
                     mac=$(echo $line | grep -o -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
-                    if [ -n "$mac" ] && is_in_subnet "$ip" "$item" && ! echo "$PROCESSED_MACS_V6" | grep -q "$mac"; then
+                    if [ -n "$mac" ] && is_in_subnet "$ip" "$actual_ip" && ! echo "$PROCESSED_MACS_V6" | grep -q "$mac"; then
                         PROCESSED_MACS_V6="$PROCESSED_MACS_V6 $mac"
                         logger -t wireguard "[$WG_INTERFACE] Marking IPv6 traffic from $ip ($mac) via ARP"
                         ip6tables -t mangle -A $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE
@@ -1280,13 +1333,13 @@ if [ "$VPN_IPS" != "none" ]; then
                 # Skip pure IPv6 IPs from this discovery as we can't 'ping' them easily blindly, but usually target-ips are IPv4.
                 # If target IS an IPv6 address, we might need manual handling, but standard usage is IPv4 target -> dual stack routing.
                 
-                mac=$(discover_mac_for_ip "$item")
+                mac=$(discover_mac_for_ip "$actual_ip")
                 
                 if [ -n "$mac" ]; then
-                    logger -t wireguard "[$WG_INTERFACE] Marking IPv6 traffic from $item ($mac)"
+                    logger -t wireguard "[$WG_INTERFACE] Marking IPv6 traffic from $actual_ip ($mac)"
                     ip6tables -t mangle -A $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE
                 else
-                    logger -t wireguard "[$WG_INTERFACE] WARNING: Could not discover MAC for $item after retries, IPv6 may not route correctly"
+                    logger -t wireguard "[$WG_INTERFACE] WARNING: Could not discover MAC for $actual_ip after retries, IPv6 may not route correctly"
                 fi
                 ;;
         esac
@@ -1333,15 +1386,16 @@ else
     DHCP_LEASE_FILE=$(get_dhcp_lease_file)
     
 if [ "$VPN_IPS" != "none" ]; then
-    for item in $VPN_IPS; do
+    for target in $VPN_IPS; do
+        actual_ip=$(get_ip_from_target "$target")
         # Skip IPv6 addresses
-        echo "$item" | grep -q ":" && continue
+        echo "$actual_ip" | grep -q ":" && continue
         
-        case "$item" in
+        case "$actual_ip" in
             */*) # Subnet - scan DHCP leases for clients
                 if [ -n "$DHCP_LEASE_FILE" ]; then
                     while read -r exp mac ip host; do
-                        if is_in_subnet "$ip" "$item" && ! echo "$PROCESSED_MACS_BLOCK" | grep -q "$mac"; then
+                        if is_in_subnet "$ip" "$actual_ip" && ! echo "$PROCESSED_MACS_BLOCK" | grep -q "$mac"; then
                             PROCESSED_MACS_BLOCK="$PROCESSED_MACS_BLOCK $mac"
                             logger -t wireguard "[$WG_INTERFACE] Blocking IPv6 for $ip ($mac) - IPv4-only tunnel"
                             ip6tables -A $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP
@@ -1359,7 +1413,7 @@ if [ "$VPN_IPS" != "none" ]; then
                 while read -r line; do
                     ip=$(echo $line | awk '{print $1}')
                     mac=$(echo $line | grep -o -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
-                    if [ -n "$mac" ] && is_in_subnet "$ip" "$item" && ! echo "$PROCESSED_MACS_BLOCK" | grep -q "$mac"; then
+                    if [ -n "$mac" ] && is_in_subnet "$ip" "$actual_ip" && ! echo "$PROCESSED_MACS_BLOCK" | grep -q "$mac"; then
                         PROCESSED_MACS_BLOCK="$PROCESSED_MACS_BLOCK $mac"
                         logger -t wireguard "[$WG_INTERFACE] Blocking IPv6 for $ip ($mac) via ARP - IPv4-only tunnel"
                         ip6tables -A $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP
@@ -1372,16 +1426,16 @@ if [ "$VPN_IPS" != "none" ]; then
                 rm -f /tmp/neigh_block_${WG_INTERFACE}_$$
                 ;;
             *) # Single IP
-                mac=$(discover_mac_for_ip "$item")
+                mac=$(discover_mac_for_ip "$actual_ip")
                 if [ -n "$mac" ]; then
-                    logger -t wireguard "[$WG_INTERFACE] Blocking IPv6 for $item ($mac) - IPv4-only tunnel"
+                    logger -t wireguard "[$WG_INTERFACE] Blocking IPv6 for $actual_ip ($mac) - IPv4-only tunnel"
                     ip6tables -A $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP
                     ip6tables -C INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null || \
                         ip6tables -A INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP
                     ip6tables -C INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP 2>/dev/null || \
                         ip6tables -A INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP
                 else
-                    logger -t wireguard "[$WG_INTERFACE] WARNING: Could not discover MAC for $item, IPv6 may leak"
+                    logger -t wireguard "[$WG_INTERFACE] WARNING: Could not discover MAC for $actual_ip, IPv6 may leak"
                 fi
                 ;;
         esac
@@ -1395,11 +1449,12 @@ fi
 logger -t wireguard "[$WG_INTERFACE] Creating/flushing ipset $IPSET_NAME."
 ipset create $IPSET_NAME hash:net 2>/dev/null || ipset flush $IPSET_NAME
 if [ "$VPN_IPS" != "none" ]; then
-    for item in $VPN_IPS; do
-        if echo "$item" | grep -q ":"; then
-             ipset add $IPSET_NAME_V6 $item 2>/dev/null
+    for target in $VPN_IPS; do
+        actual_ip=$(get_ip_from_target "$target")
+        if echo "$actual_ip" | grep -q ":"; then
+             ipset add $IPSET_NAME_V6 $actual_ip 2>/dev/null
         else
-             ipset add $IPSET_NAME $item 2>/dev/null
+             ipset add $IPSET_NAME $actual_ip 2>/dev/null
         fi
     done
 fi
@@ -1468,17 +1523,18 @@ PROCESSED_MACS=""
 DHCP_LEASE_FILE=$(get_dhcp_lease_file)
 
 if [ "$VPN_IPS" != "none" ]; then
-for item in $VPN_IPS; do
-    case "$item" in
+for target in $VPN_IPS; do
+    actual_ip=$(get_ip_from_target "$target")
+    case "$actual_ip" in
         */*) # This is a subnet
-            ip rule add from $item table $ROUTING_TABLE priority $ROUTING_TABLE 2>/dev/null
+            ip rule add from $actual_ip table $ROUTING_TABLE priority $ROUTING_TABLE 2>/dev/null
 
             # 1. DHCP Leases (Primary)
             if [ -n "$DHCP_LEASE_FILE" ]; then
                 while read -r exp mac ip host; do
-                    if is_in_subnet "$ip" "$item" && ! echo "$PROCESSED_MACS" | grep -q "$mac"; then
+                    if is_in_subnet "$ip" "$actual_ip" && ! echo "$PROCESSED_MACS" | grep -q "$mac"; then
                         PROCESSED_MACS="$PROCESSED_MACS $mac"
-                        logger -t wireguard "[$WG_INTERFACE] Found existing client $ip ($mac) in $item via DHCP lease."
+                        logger -t wireguard "[$WG_INTERFACE] Found existing client $ip ($mac) in $actual_ip via DHCP lease."
                         ip rule add from $ip table $ROUTING_TABLE priority $ROUTING_TABLE 2>/dev/null
                         handle_client_ipv6 "$mac" "$ip" "$ip"
                     fi
@@ -1490,9 +1546,9 @@ for item in $VPN_IPS; do
             while read -r line; do
                 ip=$(echo $line | awk '{print $1}')
                 mac=$(echo $line | grep -o -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
-                if [ -n "$mac" ] && is_in_subnet "$ip" "$item" && ! echo "$PROCESSED_MACS" | grep -q "$mac"; then
+                if [ -n "$mac" ] && is_in_subnet "$ip" "$actual_ip" && ! echo "$PROCESSED_MACS" | grep -q "$mac"; then
                     PROCESSED_MACS="$PROCESSED_MACS $mac"
-                    logger -t wireguard "[$WG_INTERFACE] Found existing client $ip ($mac) in $item via ARP/NDP table."
+                    logger -t wireguard "[$WG_INTERFACE] Found existing client $ip ($mac) in $actual_ip via ARP/NDP table."
                     ip rule add from $ip table $ROUTING_TABLE priority $ROUTING_TABLE 2>/dev/null
                     handle_client_ipv6 "$mac" "$ip" "$ip"
                 fi
@@ -1501,14 +1557,14 @@ for item in $VPN_IPS; do
             ;;
         *) # This is an individual IP
             # Always add rule for explicit single IPs
-            ip rule add from $item table $ROUTING_TABLE priority $ROUTING_TABLE 2>/dev/null
+            ip rule add from $actual_ip table $ROUTING_TABLE priority $ROUTING_TABLE 2>/dev/null
 
             # Discover MAC address for this IP
-            mac=$(discover_mac_for_ip "$item")
+            mac=$(discover_mac_for_ip "$actual_ip" || true)
             
             if [ -n "$mac" ] && ! echo "$PROCESSED_MACS" | grep -q "$mac"; then
-                logger -t wireguard "[$WG_INTERFACE] Found existing client $item ($mac)."
-                handle_client_ipv6 "$mac" "$item" "$item"
+                logger -t wireguard "[$WG_INTERFACE] Found existing client $actual_ip ($mac)."
+                handle_client_ipv6 "$mac" "$actual_ip" "$actual_ip"
             fi
             ;;
     esac
@@ -1747,21 +1803,22 @@ iptables -C FORWARD -j $KS_CHAIN 2>/dev/null || iptables -I FORWARD 1 -j $KS_CHA
 ip6tables -C FORWARD -j $KS_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $KS_CHAIN
 
 if [ "$VPN_IPS" != "none" ]; then
-for item in $VPN_IPS; do
-    logger -t wireguard "[$WG_INTERFACE] Blocking all traffic from $item."
-    iptables -A $KS_CHAIN -s $item -j REJECT --reject-with icmp-host-prohibited
-    case "$item" in
+for target in $VPN_IPS; do
+    actual_ip=$(get_ip_from_target "$target")
+    logger -t wireguard "[$WG_INTERFACE] Blocking all traffic from $actual_ip."
+    iptables -A $KS_CHAIN -s $actual_ip -j REJECT --reject-with icmp-host-prohibited
+    case "$actual_ip" in
         */*) # For subnets, find all known MACs and block them for IPv6
             if [ -f /cfg/dhcp.leases ]; then
                 while read -r exp mac ip host; do
-                    if is_in_subnet "$ip" "$item"; then
+                    if is_in_subnet "$ip" "$actual_ip"; then
                         ip6tables -A $KS_CHAIN -m mac --mac-source $mac -j REJECT --reject-with icmp6-adm-prohibited
                     fi
                 done < /cfg/dhcp.leases
             fi
             ;;
         *) # For individual IPs, get MAC directly
-            mac=$(ip neigh show "$item" | grep -o '[0-9a-f:]\{17\}' | head -1)
+            mac=$(ip neigh show "$actual_ip" | grep -o '[0-9a-f:]\{17\}' | head -1)
             if [ -n "$mac" ] && [ "$mac" != "<incomplete>" ]; then
                 ip6tables -A $KS_CHAIN -m mac --mac-source $mac -j REJECT --reject-with icmp6-adm-prohibited
             fi

@@ -2,13 +2,13 @@
 
 This project provides a robust, script-based solution for managing WireGuard interfaces on Route10 (OpenWrt based) routers, with a focus on Policy-Based Routing (PBR). It allows you to selectively route specific clients or subnets through different WireGuard tunnels while maintaining direct internet access for others.
 
-Tested on Route10 firmware version `1.4p`.
+Tested on Route10 firmware version `1.4r`.
 
 ## Key Features
 
 | Feature | Description |
 | --------- | ------------- |
-| IPv4/IPv6 Policy-Based Routing (PBR) | Route specific LAN clients (by IP) or subnets through specific WireGuard interfaces. |
+| IPv4/IPv6/MAC Policy-Based Routing (PBR) | Route specific LAN clients (by IP/MAC) with automatic roaming support through specific WireGuard interfaces. |
 | Internet Kill Switch (IPv4/IPv6) :shield: | Ensures that traffic designated for the VPN is blocked if the tunnel is down. |
 | IPv6 Leak Prevention :droplet: | Prevents IPv6 traffic from bypassing the VPN tunnel via the default WAN gateway. |
 | IPv4/IPv6 DNS Leak Protection :droplet: | Redirects DNS queries through the VPN to prevent leaks to ISP or public DNS servers. |
@@ -59,7 +59,7 @@ Tested on Route10 firmware version `1.4p`.
       Arguments for configuration:
         <interface_name>:   WireGuard interface name (max 11 chars)
         -c, --conf <file>:      Relative or absolute path to the wg conf file
-        -t, --target-ips <IPs>:  (Optional) Comma-separated list of IPv4 addresses/subnets
+        -t, --target-ips <IPs>:  (Optional) Comma-separated list of IPv4 addresses/subnets/MACs
         -d, --domains <domains>: (Optional) Comma-separated list of domains for split-tunnel (incompatible with -t/-r)
         -r, --routing-table <N>: (Optional) Routing table number, auto-allocated 100-199 if not provided
 
@@ -69,8 +69,8 @@ Tested on Route10 firmware version `1.4p`.
 
     Target Management (requires 05-manage-commands.sh plugin):
       ./wg-pbr.sh status [iface]             Show detailed status of all or specific interface.
-      ./wg-pbr.sh assign-ips <iface> <IPs>   Add IPs/subnets to an interface (accumulates until commit).
-      ./wg-pbr.sh remove-ips <iface> <IPs>   Remove IPs/subnets from an interface (accumulates until commit).
+      ./wg-pbr.sh assign-ips <iface> <IPs>   Add IPs/subnets/MACs to an interface (accumulates until commit).
+      ./wg-pbr.sh remove-ips <iface> <IPs>   Remove IPs/subnets/MACs from an interface (accumulates until commit).
     ```
 
     ```sh
@@ -110,7 +110,6 @@ Instead of routing specific clients *through* the VPN, you can route specific *d
 - **IPv6 Behavior**:
   - **If VPN supports IPv6**: Both IPv4 and IPv6 traffic to the domains are routed through the tunnel.
   - **If VPN is IPv4-only**: IPv4 traffic is routed, but IPv6 traffic to the domains is **blocked** (DROP) to prevent leaks.
-- **DNS Handling**: The router's DNS must be set to `dnsmasq` (default OpenWrt behavior) for this to work.
 
 ## IPv6 Handling
 

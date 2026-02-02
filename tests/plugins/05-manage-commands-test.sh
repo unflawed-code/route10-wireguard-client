@@ -9,13 +9,15 @@ cd "$SCRIPT_ROOT"
 # Discover running WireGuard interfaces from SQLite database
 discover_interfaces() {
     # Get interfaces from SQLite (committed and running interfaces)
-    sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE committed = 1 ORDER BY name;" 2>/dev/null
+    # Exclude wgssla as it's active and managed by systemic processes
+    sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE committed = 1 AND name != 'wgssla' ORDER BY name;" 2>/dev/null
 }
 
 # Discover IP-routing capable interfaces (those without domains configured)
 discover_ip_routing_interfaces() {
     # Only interfaces with NULL or empty domains support IP routing (assign-ips)
-    sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE committed = 1 AND (domains IS NULL OR domains = '') ORDER BY name;" 2>/dev/null
+    # Exclude wgssla as it's active and managed by systemic processes
+    sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE committed = 1 AND (domains IS NULL OR domains = '') AND name != 'wgssla' ORDER BY name;" 2>/dev/null
 }
 
 # Get interface count
@@ -211,6 +213,103 @@ else
 fi
 
 # --- Cleanup ---
+cleanup
+
+echo ""
+echo "=========================================="
+echo " Testing MAC Address Support"
+echo "=========================================="
+echo ""
+
+# Stage test interface for MAC tests
+log_info "Staging test interface for MAC tests..."
+./wg-pbr.sh "$TEST_IFACE" --conf "$TEST_CONF" -r 250 -t none > /dev/null 2>&1
+
+# Create dummy ARP entry for MAC resolution
+TEST_MAC="cc:dd:ee:ff:00:11"
+TEST_MAC_IP="10.97.0.100"
+ip neigh replace $TEST_MAC_IP lladdr $TEST_MAC dev br-lan nud reachable 2>/dev/null || true
+
+# --- Test: assign-ips with MAC address (colon format) ---
+log_info "Testing assign-ips with MAC address (colon format)..."
+./wg-pbr.sh assign-ips "$TEST_IFACE" "$TEST_MAC" > /dev/null 2>&1
+
+staged_targets=$(get_staged_targets "$TEST_IFACE")
+if echo "$staged_targets" | grep -q "cc:dd:ee:ff:00:11=$TEST_MAC_IP"; then
+    log_pass "assign-ips stored MAC in MAC=ip format"
+else
+    log_fail "assign-ips did not store MAC in expected format (got: $staged_targets)"
+fi
+
+# --- Test: assign-ips with MAC address (no separator format) ---
+TEST_MAC2="aabbccddeeff"
+TEST_MAC2_IP="10.97.0.101"
+ip neigh replace $TEST_MAC2_IP lladdr aa:bb:cc:dd:ee:ff dev br-lan nud reachable 2>/dev/null || true
+
+log_info "Testing assign-ips with MAC address (no separator format)..."
+./wg-pbr.sh assign-ips "$TEST_IFACE" "$TEST_MAC2" > /dev/null 2>&1
+
+staged_targets=$(get_staged_targets "$TEST_IFACE")
+if echo "$staged_targets" | grep -q "aa:bb:cc:dd:ee:ff=$TEST_MAC2_IP"; then
+    log_pass "assign-ips with no-separator MAC format works"
+else
+    log_fail "assign-ips did not handle no-separator MAC format"
+fi
+
+# --- Test: Verify status output format for MAC targets ---
+log_info "Testing status format for MAC targets..."
+./wg-pbr.sh assign-ips "$TEST_IFACE" "$TEST_MAC" > /dev/null 2>&1
+# Capture status output
+status_output=$(./wg-pbr.sh status "$TEST_IFACE")
+# Check for "MAC -> IP" single line format
+if echo "$status_output" | grep -q "${TEST_MAC} -> ${TEST_MAC_IP}"; then
+    log_pass "Status displays MAC targets in single-line 'MAC -> IP' format"
+else
+    log_fail "Status did NOT use single-line format for MAC target (or alignment broke)"
+    echo "Output was:"
+    echo "$status_output"
+fi
+
+# --- Test: remove-ips by IP should warn (strict format) ---
+log_info "Testing remove-ips by IP for MAC target (should warn)..."
+output=$(./wg-pbr.sh remove-ips "$TEST_IFACE" "$TEST_MAC_IP" 2>&1)
+if echo "$output" | grep -q "WARN.*not found"; then
+    log_pass "remove-ips by IP correctly warns for MAC target"
+else
+    log_fail "remove-ips by IP did not warn for MAC target"
+fi
+
+# --- Test: remove-ips by MAC works (strict format) ---
+log_info "Testing remove-ips by MAC (should work)..."
+./wg-pbr.sh remove-ips "$TEST_IFACE" "$TEST_MAC" > /dev/null 2>&1
+
+staged_targets=$(get_staged_targets "$TEST_IFACE")
+if ! echo "$staged_targets" | grep -q "cc:dd:ee:ff:00:11"; then
+    log_pass "remove-ips by MAC successfully removed target"
+else
+    log_fail "remove-ips by MAC did not remove target"
+fi
+
+# --- Test: MAC + IP deduplication ---
+TEST_DEDUPE_IP="10.97.0.200"
+TEST_DEDUPE_MAC="dd:ee:ff:00:11:22"
+ip neigh replace $TEST_DEDUPE_IP lladdr $TEST_DEDUPE_MAC dev br-lan nud reachable 2>/dev/null || true
+
+log_info "Testing MAC + IP deduplication..."
+./wg-pbr.sh assign-ips "$TEST_IFACE" "$TEST_DEDUPE_IP" > /dev/null 2>&1
+output=$(./wg-pbr.sh assign-ips "$TEST_IFACE" "$TEST_DEDUPE_MAC" 2>&1)
+if echo "$output" | grep -q "already in target list"; then
+    log_pass "MAC + IP deduplication works"
+else
+    log_fail "MAC + IP deduplication did not trigger"
+fi
+
+# Cleanup MAC test ARP entries
+ip neigh del $TEST_MAC_IP dev br-lan 2>/dev/null || true
+ip neigh del $TEST_MAC2_IP dev br-lan 2>/dev/null || true
+ip neigh del $TEST_DEDUPE_IP dev br-lan 2>/dev/null || true
+
+# Cleanup MAC test interface
 cleanup
 
 echo ""

@@ -23,7 +23,56 @@ wait_for_system_ready() {
     fi
 }
 
+# === MAC ADDRESS UTILITIES ===
+
+# Check if a string looks like a MAC address
+# Supports: 2a3012ef5aaa, 2a:30:12:ef:5a:aa, 2a-30-12-ef-5a-aa
+# Usage: is_mac "2a:30:12:ef:5a:aa" && echo "It's a MAC"
+is_mac() {
+    local input="$1"
+    # Remove separators and check for 12 hex characters
+    local clean=$(echo "$input" | tr -d ':-' | tr 'A-F' 'a-f')
+    [ ${#clean} -eq 12 ] && echo "$clean" | grep -qE '^[0-9a-f]{12}$'
+}
+
+# Normalize MAC address to lowercase colon-separated format
+# Input: 2a3012ef5aaa, 2a:30:12:ef:5a:aa, 2a-30-12-ef-5a-aa
+# Output: 2a:30:12:ef:5a:aa
+# Returns 1 if invalid
+# Usage: mac=$(normalize_mac "2a3012ef5aaa")
+normalize_mac() {
+    local input="$1"
+    # Remove separators and lowercase
+    local clean=$(echo "$input" | tr -d ':-' | tr 'A-F' 'a-f')
+    # Validate 12 hex chars
+    if [ ${#clean} -ne 12 ] || ! echo "$clean" | grep -qE '^[0-9a-f]{12}$'; then
+        return 1
+    fi
+    # Insert colons: aabbccddeeff -> aa:bb:cc:dd:ee:ff
+    echo "$clean" | sed 's/\(..\)/\1:/g; s/:$//'
+}
+
+# Resolve MAC address to IP via ARP/neighbor table
+# Usage: ip=$(resolve_mac_to_ip "2a:30:12:ef:5a:aa")
+resolve_mac_to_ip() {
+    local mac="$1"
+    # Normalize to ensure consistent format
+    mac=$(normalize_mac "$mac") || return 1
+    # Check neighbor table (both IPv4 and IPv6)
+    ip neigh show | awk -v mac="$mac" 'tolower($5)==mac && $NF!="FAILED" {print $1; exit}'
+}
+
 # === IP ADDRESS UTILITIES ===
+
+# Extract IP part from target (handles plain IP, CIDR, or MAC=IP format)
+# Usage: ip=$(get_ip_from_target "aa:bb:cc:dd:ee:ff=10.90.1.10") -> 10.90.1.10
+get_ip_from_target() {
+    local target="$1"
+    case "$target" in
+        *=*) echo "${target#*=}" ;;
+        *)   echo "$target" ;;
+    esac
+}
 
 # Convert IPv4 address to integer for subnet calculations
 # Usage: ip_to_int "192.168.1.1"
@@ -61,12 +110,13 @@ is_in_list() {
     local ip_to_check="$1" list="$2" ip_int item
     ip_int=$(ip_to_int "$ip_to_check")
     for item in $list; do
-        case "$item" in
+        local actual_ip=$(get_ip_from_target "$item")
+        case "$actual_ip" in
             */*)
-                is_in_subnet "$ip_to_check" "$item" && return 0
+                is_in_subnet "$ip_to_check" "$actual_ip" && return 0
                 ;;
             *)
-                [ "$item" = "$ip_to_check" ] && return 0
+                [ "$actual_ip" = "$ip_to_check" ] && return 0
                 ;;
         esac
     done
@@ -226,23 +276,46 @@ cleanup_mac_for_ip() {
     local WG_TMP_DIR="/tmp/wg-custom"
     local WG_DB_PATH="${WG_TMP_DIR}/wg_pbr.db"
     
-    [ ! -f "$WG_DB_PATH" ] && return 0
+    local mac=""
+    local rt=""
     
-    # Find MAC address for this IP from SQLite
-    local mac_entry=$(sqlite3 -separator '|' "$WG_DB_PATH" "SELECT * FROM mac_state WHERE interface = '$iface' AND ip = '$removed_ip';" 2>/dev/null)
-    [ -z "$mac_entry" ] && return 0
+    # 1. Try to find MAC address for this IP from SQLite state
+    if [ -f "$WG_DB_PATH" ]; then
+        local mac_entry=$(sqlite3 -separator '|' "$WG_DB_PATH" "SELECT mac, routing_table FROM mac_state WHERE interface = '$iface' AND ip = '$removed_ip' LIMIT 1;" 2>/dev/null)
+        if [ -n "$mac_entry" ]; then
+            mac=$(echo "$mac_entry" | cut -d'|' -f1)
+            rt=$(echo "$mac_entry" | cut -d'|' -f2)
+        fi
+    fi
     
-    local mac=$(echo "$mac_entry" | cut -d'|' -f1)
-    local rt=$(echo "$mac_entry" | cut -d'|' -f4)
-    local ipv6_sup=$(echo "$mac_entry" | cut -d'|' -f5)
+    # 2. Fallback: If not in DB, try to discover MAC via neighbor table
+    # This addresses the "stale rule" issue where DB is out of sync but firewall rules persist
+    if [ -z "$mac" ]; then
+        mac=$(discover_mac_for_ip "$removed_ip" || true)
+        # If we discovered a MAC but lack a routing table, try to get it from the interface registry
+        if [ -n "$mac" ] && [ -z "$rt" ] && [ -f "$WG_DB_PATH" ]; then
+            rt=$(sqlite3 "$WG_DB_PATH" "SELECT routing_table FROM interfaces WHERE name = '$iface' LIMIT 1;" 2>/dev/null)
+        fi
+    fi
     
+    # If we still have no MAC, we can't clean up MAC-based rules
     [ -z "$mac" ] && return 0
     
-    # Validate rt is a number (may be empty or invalid for malformed entries)
-    [ -z "$rt" ] && return 0
-    case "$rt" in
-        ''|*[!0-9]*) return 0 ;;  # Not a valid number, skip
-    esac
+    # Validate rt is a number
+    if [ -z "$rt" ] || ! echo "$rt" | grep -qE '^[0-9]+$'; then
+        # Last ditch effort: if we have a MAC but no table, we try to scrub it from the known marks chain 
+        # using a grep-and-delete approach to be robust
+        local mark_chain="mark_ipv6_${iface}"
+        if ip6tables -t mangle -L "$mark_chain" -n >/dev/null 2>&1; then
+            echo "  WARNING: MAC discovered for $removed_ip but routing table unknown. Attempting bulk scrub."
+            # Find and delete any rule matching this MAC in this chain
+            while ip6tables -t mangle -S "$mark_chain" | grep -q "$mac"; do
+                local rule_spec=$(ip6tables -t mangle -S "$mark_chain" | grep "$mac" | head -1 | sed 's/-A/-D/')
+                ip6tables -t mangle $rule_spec 2>/dev/null || break
+            done
+        fi
+        return 0
+    fi
     
     # Clean up firewall rules for this client
     local MARK_VALUE="$((0x10000 + rt))"
@@ -251,8 +324,9 @@ cleanup_mac_for_ip() {
     local BLOCK_IPV4_ONLY_CHAIN="${iface}_ipv4_only_block"
     local BLOCK_IPV6_DNS_INPUT_CHAIN="${iface}_v6_dns_in"
     
-    # Remove IPv6 fwmark rule
+    # Remove IPv6 fwmark rule - Try both MARK and XMARK versions for resilience
     ip6tables -t mangle -D $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
+    ip6tables -t mangle -D $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-xmark $(printf "0x%x" $MARK_VALUE)/0xffffffff 2>/dev/null || true
     
     # Remove IPv6 block rules
     local lan_ifaces=$(get_lan_ifaces)
@@ -282,7 +356,6 @@ cleanup_mac_for_ip() {
     iptables -D $dns_filter_chain -s $removed_ip -p tcp --dport 853 -j REJECT --reject-with tcp-reset 2>/dev/null || true
     
     # Clean up DoH block rules by IP (port 443 with string matching)
-    # Get domains from https-dns-proxy config and clean up each
     if [ -f /etc/config/https-dns-proxy ]; then
         local domains=$(grep 'resolver_url' /etc/config/https-dns-proxy 2>/dev/null | awk -F'/' '{print $3}')
         for domain in $domains; do
@@ -292,7 +365,9 @@ cleanup_mac_for_ip() {
     fi
     
     # Remove MAC state entry from SQLite
-    sqlite3 "$WG_DB_PATH" "DELETE FROM mac_state WHERE interface = '$iface' AND mac = '$mac';" 2>/dev/null || true
+    if [ -f "$WG_DB_PATH" ]; then
+        sqlite3 "$WG_DB_PATH" "DELETE FROM mac_state WHERE interface = '$iface' AND mac = '$mac';" 2>/dev/null || true
+    fi
     
     # Clean up state files
     local mac_clean="${mac//:/}"
@@ -336,19 +411,19 @@ update_ipset_targets() {
         # Check if this IP is still in new list
         local still_exists=0
         for new_ip in $(echo "$new_ips" | tr ',' ' '); do
-            [ "$old_ip" = "$new_ip" ] && still_exists=1 && break
+            local actual_ip=$(get_ip_from_target "$new_ip")
+            [ "$old_ip" = "$actual_ip" ] && still_exists=1 && break
         done
         if [ "$still_exists" = "0" ]; then
             # Remove ip rule for this IP
             ip rule del from "$old_ip" lookup "$rt_name" 2>/dev/null && \
-                echo "  Removed ip rule: from $old_ip lookup $rt_name"
+                echo "  Removed ip rule: from $old_ip lookup $rt_name" || true
             
             # Remove DNS DNAT rules for this IP (prevents DNAT conflicts when IP moves to another interface)
-            # Must use loop since iptables -D requires exact match including --to-destination
             local dns_nat_chain="vpn_dns_nat_${iface}"
             while iptables -t nat -L "$dns_nat_chain" --line-numbers -n 2>/dev/null | grep -q "^[0-9].*${old_ip}"; do
                 local line_num=$(iptables -t nat -L "$dns_nat_chain" --line-numbers -n 2>/dev/null | grep "^[0-9].*${old_ip}" | head -1 | awk '{print $1}')
-                [ -n "$line_num" ] && iptables -t nat -D "$dns_nat_chain" "$line_num" && echo "  Removed DNS DNAT rule $line_num for $old_ip"
+                [ -n "$line_num" ] && iptables -t nat -D "$dns_nat_chain" "$line_num" 2>/dev/null && echo "  Removed DNS DNAT rule $line_num for $old_ip" || true
             done
             
             # Clean up MAC state and IPv6 firewall rules for this IP
@@ -359,17 +434,18 @@ update_ipset_targets() {
     # Add new ip rules for IPs that need them
     if [ "$new_ips" != "none" ]; then
         for new_ip in $(echo "$new_ips" | tr ',' ' '); do
-            # Skip IPv6
-            case "$new_ip" in
+            local actual_ip=$(get_ip_from_target "$new_ip")
+            # Skip IPv6 (actual_ip won't have the MAC part anymore)
+            case "$actual_ip" in
                 *:*) continue ;;
             esac
             
             # Check if ip rule already exists (more reliable than old_ips comparison)
-            if ! ip rule show | grep -q "from $new_ip lookup $rt_name"; then
-                ip rule add from "$new_ip" lookup "$rt_name" 2>/dev/null && \
-                    echo "  Added ip rule: from $new_ip lookup $rt_name"
+            if ! ip rule show | grep -q "from $actual_ip lookup $rt_name"; then
+                ip rule add from "$actual_ip" lookup "$rt_name" 2>/dev/null && \
+                    echo "  Added ip rule: from $actual_ip lookup $rt_name"
                 # Mark for DHCP re-processing (DNS/IPv6 rules)
-                ips_to_reprocess="$ips_to_reprocess $new_ip"
+                ips_to_reprocess="$ips_to_reprocess $actual_ip"
             fi
         done
     fi
@@ -379,10 +455,11 @@ update_ipset_targets() {
     ipset flush "$ipset_v6" 2>/dev/null || true
     
     if [ "$new_ips" != "none" ]; then
-        for ip in $(echo "$new_ips" | tr ',' ' '); do
-            case "$ip" in
-                *:*) ipset add "$ipset_v6" "$ip" 2>/dev/null ;;
-                *)   ipset add "$ipset_name" "$ip" 2>/dev/null ;;
+        for target in $(echo "$new_ips" | tr ',' ' '); do
+            local actual_ip=$(get_ip_from_target "$target")
+            case "$actual_ip" in
+                *:*) ipset add "$ipset_v6" "$actual_ip" 2>/dev/null ;;
+                *)   ipset add "$ipset_name" "$actual_ip" 2>/dev/null ;;
             esac
         done
     fi
@@ -401,19 +478,18 @@ update_ipset_targets() {
         grep -oE 'to:[0-9.]+' | head -1 | cut -d: -f2)
     
     if [ -n "$dns_server" ]; then
-        # Ensure DNS DNAT exists for ALL single IPs (not just new ones)
-        # This handles the case where an IP is moved back to a previous interface
         if [ "$new_ips" != "none" ]; then
-            for ip in $(echo "$new_ips" | tr ',' ' '); do
+            for target in $(echo "$new_ips" | tr ',' ' '); do
+                local actual_ip=$(get_ip_from_target "$target")
                 # Add for single IPs and subnets (skip IPv6)
-                case "$ip" in
+                case "$actual_ip" in
                     *:*) ;; # Skip IPv6
                     *)
                         # Check if rule already exists
-                        if ! iptables -t nat -C "$dns_nat_chain" -s "$ip" -p udp --dport 53 -j DNAT --to-destination "$dns_server" 2>/dev/null; then
-                            iptables -t nat -A "$dns_nat_chain" -s "$ip" -p udp --dport 53 -j DNAT --to-destination "$dns_server"
-                            iptables -t nat -A "$dns_nat_chain" -s "$ip" -p tcp --dport 53 -j DNAT --to-destination "$dns_server"
-                            echo "  Added DNS DNAT: $ip -> $dns_server"
+                        if ! iptables -t nat -C "$dns_nat_chain" -s "$actual_ip" -p udp --dport 53 -j DNAT --to-destination "$dns_server" 2>/dev/null; then
+                            iptables -t nat -A "$dns_nat_chain" -s "$actual_ip" -p udp --dport 53 -j DNAT --to-destination "$dns_server" || true
+                            iptables -t nat -A "$dns_nat_chain" -s "$actual_ip" -p tcp --dport 53 -j DNAT --to-destination "$dns_server" || true
+                            echo "  Added DNS DNAT: $actual_ip -> $dns_server"
                         fi
                         ;;
                 esac
@@ -422,15 +498,16 @@ update_ipset_targets() {
     fi
     
     # Trigger DHCP re-processing for ALL single IPs to ensure IPv6 rules are set up
-    # This is essential when IPs move between IPv6-enabled and IPv4-only interfaces
     if [ "$new_ips" != "none" ]; then
-        for ip in $(echo "$new_ips" | tr ',' ' '); do
-            case "$ip" in
+        for target in $(echo "$new_ips" | tr ',' ' '); do
+            local actual_ip=$(get_ip_from_target "$target")
+            case "$actual_ip" in
                 */*) ;; # Skip subnets
                 *:*) ;; # Skip IPv6
                 *)
                     # Write to temp file (survives subshell in commit loop)
-                    echo "$ip" >> "${WG_TMP_DIR}/deferred_dhcp.tmp"
+                    # Use full target string to preserve MAC=IP if present
+                    echo "$target" >> "${WG_TMP_DIR}/deferred_dhcp.tmp"
                     ;;
             esac
         done

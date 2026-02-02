@@ -165,6 +165,29 @@ db_find_interface_by_ip() {
     sqlite3 "$WG_DB_PATH" "SELECT name FROM interfaces WHERE target_ips = '$ip' OR target_ips LIKE '$ip,%' OR target_ips LIKE '%,$ip' OR target_ips LIKE '%,$ip,%';"
 }
 
+# Find interface that has a subnet containing the given IP
+# Returns: interface_name|subnet (or empty if none)
+# Usage: db_find_subnet_for_ip <ip>
+db_find_subnet_for_ip() {
+    local ip="$1"
+    local interfaces=$(sqlite3 "$WG_DB_PATH" "SELECT name, target_ips FROM interfaces WHERE target_ips LIKE '%/%';")
+    
+    echo "$interfaces" | while IFS='|' read -r iface targets; do
+        [ -z "$iface" ] && continue
+        for target in $(echo "$targets" | tr ',' ' '); do
+            case "$target" in
+                */*) 
+                    # It's a subnet - check if IP is in it
+                    if is_in_subnet "$ip" "$target" 2>/dev/null; then
+                        echo "$iface|$target"
+                        return 0
+                    fi
+                    ;;
+            esac
+        done
+    done
+}
+
 # Get interface data in registry format (for backward compatibility)
 # Returns: iface|routing_table|target_ips|ipv6_support|ipv6_subnets|nat66|start_time
 # Usage: db_get_registry_entry <name>

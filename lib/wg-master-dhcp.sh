@@ -8,7 +8,7 @@ WG_DB_PATH="${WG_TMP_DIR}/wg_pbr.db"
 WG_MAC_STATE="${WG_TMP_DIR}/mac_state"
 LOCK_FILE="${WG_TMP_DIR}/dhcp_hotplug.lock"
 
-[ "$ACTION" = "add" ] || [ "$ACTION" = "new" ] || [ "$ACTION" = "old" ] || exit 0
+[ "$ACTION" = "add" ] || [ "$ACTION" = "new" ] || [ "$ACTION" = "old" ] || [ "$ACTION" = "update" ] || exit 0
 [ -f "$WG_DB_PATH" ] || exit 0
 
 # Acquire lock to prevent race conditions (BusyBox flock doesn't support -w)
@@ -17,6 +17,16 @@ flock -x 200 || exit 1
 
 # === INJECTED COMMON LIBRARY ===
 # === IP ADDRESS UTILITIES ===
+
+# Extract IP part from target (handles plain IP, CIDR, or MAC=IP format)
+# Usage: ip=$(get_ip_from_target "aa:bb:cc:dd:ee:ff=10.90.1.10") -> 10.90.1.10
+get_ip_from_target() {
+    local target="$1"
+    case "$target" in
+        *=*) echo "${target#*=}" ;;
+        *)   echo "$target" ;;
+    esac
+}
 
 # Convert IPv4 address to integer for subnet calculations
 # Usage: ip_to_int "192.168.1.1"
@@ -54,12 +64,13 @@ is_in_list() {
     local ip_to_check="$1" list="$2" ip_int item
     ip_int=$(ip_to_int "$ip_to_check")
     for item in $list; do
-        case "$item" in
+        local actual_ip=$(get_ip_from_target "$item")
+        case "$actual_ip" in
             */*)
-                is_in_subnet "$ip_to_check" "$item" && return 0
+                is_in_subnet "$ip_to_check" "$actual_ip" && return 0
                 ;;
             *)
-                [ "$item" = "$ip_to_check" ] && return 0
+                [ "$actual_ip" = "$ip_to_check" ] && return 0
                 ;;
         esac
     done

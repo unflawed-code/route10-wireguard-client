@@ -14,6 +14,13 @@ elif [ -f "/cfg/wg-custom/lib/wg-db.sh" ]; then
     . "/cfg/wg-custom/lib/wg-db.sh"
 fi
 
+# Source common utilities for MAC address functions
+if [ -f "${LIB_DIR:-./lib}/wg-common.sh" ]; then
+    . "${LIB_DIR:-./lib}/wg-common.sh"
+elif [ -f "/cfg/wg-custom/lib/wg-common.sh" ]; then
+    . "/cfg/wg-custom/lib/wg-common.sh"
+fi
+
 # Hook: Display available commands in usage/help
 show_plugin_help() {
     echo ""
@@ -127,98 +134,177 @@ cmd_status_all() {
     done
 }
 
-# STATUS command
+# STATUS command - Pretty table-like output
 cmd_status() {
     local iface="$1"
-    
-    echo "=== Status for $iface ==="
-    echo ""
     
     # Try SQLite database first
     local db_entry=$(db_get_interface "$iface" 2>/dev/null)
     
-    if [ -n "$db_entry" ]; then
-        # Parse SQLite entry: name|conf|routing_table|target_ips|domains|committed|target_only|ipv6_support|ipv6_subnets|nat66|start_time|running
-        local rt=$(echo "$db_entry" | cut -d'|' -f3)
-        local vpn_ips=$(echo "$db_entry" | cut -d'|' -f4)
-        # Field 5 is domains (not used in status display)
-        local committed=$(echo "$db_entry" | cut -d'|' -f6)
-        # Field 7 is target_only (not used in status display)
-        local ipv6=$(echo "$db_entry" | cut -d'|' -f8)
-        local ip6_subs=$(echo "$db_entry" | cut -d'|' -f9)
-        local nat66=$(echo "$db_entry" | cut -d'|' -f10)
-        local start_time=$(echo "$db_entry" | cut -d'|' -f11)
-        local running=$(echo "$db_entry" | cut -d'|' -f12)
-        local conf=$(echo "$db_entry" | cut -d'|' -f2)
-        
-        echo "Routing Table: $rt (${iface}_rt)"
-        
-        # Check if this is a split-tunnel interface
-        local domains=$(echo "$db_entry" | cut -d'|' -f5)
-        if [ -n "$domains" ] && [ "$domains" != "" ]; then
-            echo "Mode:          Split-Tunnel"
-            echo "Domains:       $domains"
-        else
-            if [ -n "$vpn_ips" ] && [ "$vpn_ips" != "" ] && [ "$vpn_ips" != "none" ]; then
-                echo "Target IPs:    $(echo $vpn_ips | tr ',' ' ')"
-            else
-                echo "Target IPs:    (No targets)"
-            fi
-        fi
-        echo "IPv6 Support:  $([ "$ipv6" = "1" ] && echo "Yes" || echo "No")"
-        [ -n "$ip6_subs" ] && [ "$ip6_subs" != "" ] && echo "IPv6 Subnets:  $ip6_subs"
-        [ "$nat66" = "1" ] && echo "NAT66:         Enabled"
-        
-        # Show uptime
-        if [ -n "$start_time" ] && [ "$start_time" -gt 0 ] 2>/dev/null; then
-            local now=$(date +%s)
-            local uptime_secs=$((now - start_time))
-            local days=$((uptime_secs / 86400))
-            local hours=$(((uptime_secs % 86400) / 3600))
-            local mins=$(((uptime_secs % 3600) / 60))
-            local secs=$((uptime_secs % 60))
-            local uptime_str=""
-            [ $days -gt 0 ] && uptime_str="${days}d "
-            [ $hours -gt 0 ] || [ $days -gt 0 ] && uptime_str="${uptime_str}${hours}h "
-            [ $mins -gt 0 ] || [ $hours -gt 0 ] || [ $days -gt 0 ] && uptime_str="${uptime_str}${mins}m "
-            uptime_str="${uptime_str}${secs}s"
-            echo "Uptime:        $uptime_str"
-        fi
-        
-        echo ""
-        [ -n "$conf" ] && echo "Config File:   $conf"
-        echo "Staged:        $([ "$committed" = "1" ] && echo "Committed" || echo "Pending commit")"
-        
-    else
-        echo "Interface not found in database"
+    if [ -z "$db_entry" ]; then
+        echo "Interface $iface not found in database"
+        return 1
     fi
     
-    # Show if interface is active and its public IPs
+    # Parse SQLite entry
+    local conf=$(echo "$db_entry" | cut -d'|' -f2)
+    local rt=$(echo "$db_entry" | cut -d'|' -f3)
+    local vpn_ips=$(echo "$db_entry" | cut -d'|' -f4)
+    local domains=$(echo "$db_entry" | cut -d'|' -f5)
+    local committed=$(echo "$db_entry" | cut -d'|' -f6)
+    local ipv6=$(echo "$db_entry" | cut -d'|' -f8)
+    local ip6_subs=$(echo "$db_entry" | cut -d'|' -f9)
+    local nat66=$(echo "$db_entry" | cut -d'|' -f10)
+    local start_time=$(echo "$db_entry" | cut -d'|' -f11)
+    
+    # Determine interface status
+    local iface_status_display="Inactive ❌"
+    local pub_ipv4=""
+    local pub_ipv6=""
+    
     if ip link show "$iface" >/dev/null 2>&1; then
-        local vpn_ip6=$(ip -6 addr show "$iface" 2>/dev/null | awk '/inet6 / && !/fe80/ {split($2,a,"/"); print a[1]}' | head -1)
-        echo "Interface:     Active"
-        [ -n "$vpn_ip6" ] && echo "Public IPv6:   $vpn_ip6"
+        iface_status_display="Active ✅"
+        pub_ipv6=$(ip -6 addr show "$iface" 2>/dev/null | awk '/inet6 / && !/fe80/ {split($2,a,"/"); print a[1]}' | head -1)
         
-        # Check for pre-fetched public IP (from cmd_status_all) or fetch if not present
+        # Check for pre-fetched public IP or fetch
         local tmp_ip="${WG_TMP_DIR}/wg_pub_ip_${iface}"
         if [ -s "$tmp_ip" ]; then
-            echo "Public IPv4:   $(cat $tmp_ip)"
+            pub_ipv4=$(cat "$tmp_ip")
             rm -f "$tmp_ip" 2>/dev/null
         else
-            # Direct status call - fetch synchronously but with short timeout
-            local pub_ip=$(curl -4 -s --max-time 2 --interface "$iface" ifconfig.me 2>/dev/null)
-            [ -n "$pub_ip" ] && echo "Public IPv4:   $pub_ip"
+            pub_ipv4=$(curl -4 -s --max-time 2 --interface "$iface" ifconfig.me 2>/dev/null)
         fi
-    else
-        echo "Interface:     Not active"
     fi
+    
+    # Calculate uptime
+    local uptime_str="-"
+    if [ -n "$start_time" ] && [ "$start_time" -gt 0 ] 2>/dev/null; then
+        local now=$(date +%s)
+        local uptime_secs=$((now - start_time))
+        local days=$((uptime_secs / 86400))
+        local hours=$(((uptime_secs % 86400) / 3600))
+        local mins=$(((uptime_secs % 3600) / 60))
+        local secs=$((uptime_secs % 60))
+        uptime_str=""
+        [ $days -gt 0 ] && uptime_str="${days}d "
+        [ $hours -gt 0 ] || [ $days -gt 0 ] && uptime_str="${uptime_str}${hours}h "
+        [ $mins -gt 0 ] || [ $hours -gt 0 ] || [ $days -gt 0 ] && uptime_str="${uptime_str}${mins}m "
+        uptime_str="${uptime_str}${secs}s"
+        [ -n "$uptime_str" ] && uptime_str="$uptime_str ⏱️"
+    fi
+    
+    # Determine mode
+    local mode_display="Client Routing 🌐"
+    local is_split=0
+    if [ -n "$domains" ] && [ "$domains" != "" ]; then
+        mode_display="Split-Tunnel 🛡️"
+        is_split=1
+    fi
+    
+    # Print header (+2 for 4-byte 🔗)
+    echo "+-----------------------------------------------------------------------+"
+    printf "| %-71s |\n" "$iface 🔗"
+    echo "+------------------+----------------------------------------------------+"
+    
+    # Interface section
+    # Label col: 16 visual | Value col: 50 visual
+    # Compensation for multi-byte emojis in 2nd column
+    printf "| %-16s | %-51s |\n" "Status" "$iface_status_display"
+    printf "| %-16s | %-52s |\n" "Mode" "$mode_display"
+    
+    # Calculate padding for Uptime based on emoji presence (⏱️ is 6 bytes but 2 columns)
+    local uptime_padding=50
+    if echo "$uptime_str" | grep -q "⏱️"; then
+        uptime_padding=54
+    fi
+    printf "| %-16s | %-${uptime_padding}s |\n" "Uptime" "$uptime_str"
+    
+    printf "| %-16s | %-51s |\n" "Staged" "$([ "$committed" = "1" ] && echo "Committed ✅" || echo "Pending ⏳")"
+    
+    # Network section
+    echo "+------------------+----------------------------------------------------+"
+    printf "| %-16s | %-50s |\n" "Routing Table" "$rt (${iface}_rt)"
+    printf "| %-16s | %-51s |\n" "IPv6 Support" "$([ "$ipv6" = "1" ] && echo "Yes ✅" || echo "No ❌")"
+    [ "$nat66" = "1" ] && printf "| %-16s | %-51s |\n" "NAT66" "Enabled ✅"
+    [ -n "$pub_ipv4" ] && printf "| %-16s | %-50s |\n" "Public IPv4" "$pub_ipv4"
+    [ -n "$pub_ipv6" ] && printf "| %-16s | %-50s |\n" "Public IPv6" "$pub_ipv6"
+    
+    # Targets section
+    echo "+------------------+----------------------------------------------------+"
+    if [ "$is_split" = "1" ]; then
+        local first=1
+        for domain in $(echo "$domains" | tr ',' ' '); do
+            if [ "$first" = "1" ]; then
+                printf "| %-16s | %-50s |\n" "Domains" "$domain"
+                first=0
+            else
+                printf "| %-16s | %-50s |\n" "" "$domain"
+            fi
+        done
+    else
+        if [ -n "$vpn_ips" ] && [ "$vpn_ips" != "" ] && [ "$vpn_ips" != "none" ]; then
+            local first=1
+            for target in $(echo "$vpn_ips" | tr ',' ' '); do
+                case "$target" in
+                    *=*)
+                        # MAC=ip format - Consolidate into single line for better alignment
+                        local mac="${target%%=*}"
+                        local resolved="${target#*=}"
+                        if [ "$first" = "1" ]; then
+                            printf "| %-16s | %-50s |\n" "Targets" "$mac -> $resolved"
+                            first=0
+                        else
+                            printf "| %-16s | %-50s |\n" "" "$mac -> $resolved"
+                        fi
+                        ;;
+                    *)
+                        # Plain IP/subnet
+                        if [ "$first" = "1" ]; then
+                            printf "| %-16s | %-50s |\n" "Targets" "$target"
+                            first=0
+                        else
+                            printf "| %-16s | %-50s |\n" "" "$target"
+                        fi
+                        ;;
+                esac
+            done
+        else
+            printf "| %-16s | %-50s |\n" "Targets" "(No targets)"
+        fi
+    fi
+    
+    # Config section - Multi-line wrapping for long paths
+    echo "+------------------+----------------------------------------------------+"
+    if [ -n "$conf" ]; then
+        local val_w=50
+        if [ ${#conf} -le $val_w ]; then
+            printf "| %-16s | %-50s |\n" "Config" "$conf"
+        else
+            # Wrap long path
+            local start=1
+            while [ $start -le ${#conf} ]; do
+                local chunk=$(echo "$conf" | cut -c $start-$((start + val_w - 1)))
+                if [ $start -eq 1 ]; then
+                    printf "| %-16s | %-50s |\n" "Config" "$chunk"
+                else
+                    printf "| %-16s | %-50s |\n" "" "$chunk"
+                fi
+                start=$((start + val_w))
+            done
+        fi
+    fi
+    [ -n "$ip6_subs" ] && [ "$ip6_subs" != "" ] && printf "| %-16s | %-50s |\n" "IPv6 Subnets" "$ip6_subs"
+    
+    echo "+-----------------------------------------------------------------------+"
 }
 
 # REMOVE-IP command - Accumulates removals from STAGED targets until commit
-# Supports comma-separated IPs. Multiple calls accumulate unique removals.
+# Supports comma-separated IPs/MACs. Strict format matching:
+# - MACs must be removed with MAC format (even if resolved IP matches)
+# - IPs must be removed with IP format
 cmd_remove_ip() {
     local iface="$1"
-    local ip_list="$2"
+    local input_list="$2"
     
     # Get current staged entry from SQLite
     local staged_entry=$(db_get_staged "$iface" 2>/dev/null)
@@ -239,22 +325,77 @@ cmd_remove_ip() {
     # Parse: name|conf|routing_table|target_ips|committed|target_only
     local current_targets=$(echo "$staged_entry" | cut -d'|' -f4 | tr ',' ' ')
     
-    # Build new targets by removing specified IPs from current
+    # Build new targets by removing specified items from current
     local new_targets=""
-    local removal_list=$(echo "$ip_list" | tr ',' ' ')
+    local removal_list=$(echo "$input_list" | tr ',' ' ')
+    local removed_any=0
     
     for target in $current_targets; do
         local should_remove=0
-        for ip_to_remove in $removal_list; do
-            if [ "$target" = "$ip_to_remove" ]; then
-                should_remove=1
-                echo "Removing $ip_to_remove from $iface"
-                break
+        
+        for to_remove in $removal_list; do
+            # Normalize to_remove if it's a MAC
+            local match_key="$to_remove"
+            if is_mac "$to_remove" 2>/dev/null; then
+                match_key=$(normalize_mac "$to_remove")
             fi
+            
+            # Check target format
+            case "$target" in
+                *=*)
+                    # Target is MAC=ip format
+                    local target_mac="${target%%=*}"
+                    if [ "$target_mac" = "$match_key" ]; then
+                        should_remove=1
+                        echo "Removing MAC $target_mac from $iface"
+                        removed_any=1
+                        break
+                    fi
+                    ;;
+                *)
+                    # Target is plain IP/subnet
+                    if [ "$target" = "$to_remove" ]; then
+                        should_remove=1
+                        echo "Removing $to_remove from $iface"
+                        removed_any=1
+                        break
+                    fi
+                    ;;
+            esac
         done
+        
         if [ "$should_remove" = "0" ]; then
             [ -n "$new_targets" ] && new_targets="${new_targets},"
             new_targets="${new_targets}${target}"
+        fi
+    done
+    
+    # Warn about items that weren't found
+    for to_remove in $removal_list; do
+        local found=0
+        local match_key="$to_remove"
+        if is_mac "$to_remove" 2>/dev/null; then
+            match_key=$(normalize_mac "$to_remove")
+        fi
+        
+        for target in $current_targets; do
+            case "$target" in
+                *=*)
+                    local target_mac="${target%%=*}"
+                    [ "$target_mac" = "$match_key" ] && found=1 && break
+                    ;;
+                *)
+                    [ "$target" = "$to_remove" ] && found=1 && break
+                    ;;
+            esac
+        done
+        
+        if [ "$found" = "0" ]; then
+            if is_mac "$to_remove" 2>/dev/null; then
+                echo "WARN: MAC $match_key not found in targets (was it added as IP instead?)"
+            else
+                echo "WARN: $to_remove not found in targets"
+            fi
         fi
     done
     
@@ -264,7 +405,6 @@ cmd_remove_ip() {
     fi
     
     # Update database with new targets
-    # Set target_only=1 if interface was already committed (hot-reload path)
     local target_only=0
     is_interface_committed "$iface" && target_only=1
     
@@ -274,12 +414,13 @@ cmd_remove_ip() {
     echo "Run './wg-pbr.sh commit' to apply changes"
 }
 
-# ASSIGN-IP command - Accumulates IPs to STAGED targets until commit
-# Supports comma-separated IPs. Multiple calls accumulate unique IPs.
+# ASSIGN-IP command - Accumulates IPs/MACs to STAGED targets until commit
+# Supports comma-separated IPs/MACs. Multiple calls accumulate unique targets.
+# MAC addresses are stored as MAC=resolved_ip for strict format tracking.
 # Automatically moves IPs from other interfaces.
 cmd_assign_ip() {
     local iface="$1"
-    local ip_list="$2"
+    local input_list="$2"
     
     # Get current staged entry from SQLite
     local staged_entry=$(db_get_staged "$iface" 2>/dev/null)
@@ -297,52 +438,100 @@ cmd_assign_ip() {
         return 1
     fi
     
-    # Check each IP for conflicts and move if needed
-    for ip_to_add in $(echo "$ip_list" | tr ',' ' '); do
-        local current_owner=$(find_interface_for_ip "$ip_to_add")
-        if [ -n "$current_owner" ] && [ "$current_owner" != "$iface" ]; then
-            echo "Moving $ip_to_add from $current_owner to $iface"
-            cmd_remove_ip "$current_owner" "$ip_to_add"
-        fi
-    done
-    
-    # Re-read staged entry after potential modifications from cmd_remove_ip
-    staged_entry=$(db_get_staged "$iface" 2>/dev/null)
-    
     # Parse: name|conf|routing_table|target_ips|committed|target_only
     local current_targets=$(echo "$staged_entry" | cut -d'|' -f4 | tr ',' ' ')
     
-    local new_targets_list=""
+    # Build list of currently resolved IPs (for dedup checking)
+    local current_resolved_ips=""
+    if [ -n "$current_targets" ] && [ "$current_targets" != "none" ]; then
+        for target in $current_targets; do
+            case "$target" in
+                *=*)
+                    # MAC=ip format - extract resolved IP
+                    current_resolved_ips="$current_resolved_ips ${target#*=}"
+                    ;;
+                *)
+                    # Plain IP/subnet
+                    current_resolved_ips="$current_resolved_ips $target"
+                    ;;
+            esac
+        done
+    fi
     
-    # Start with current staged targets
+    local new_targets_list=""
     if [ -n "$current_targets" ] && [ "$current_targets" != "none" ]; then
         new_targets_list="$current_targets"
     fi
     
-    # Add new IPs (avoiding duplicates)
-    for ip_to_add in $(echo "$ip_list" | tr ',' ' '); do
-        local exists=0
-        for existing in $new_targets_list; do
-            if [ "$existing" = "$ip_to_add" ]; then
-                exists=1
+    # Process each input target
+    for input_target in $(echo "$input_list" | tr ',' ' '); do
+        local store_format=""
+        local resolved_ip=""
+        
+        # Check if this is a MAC address
+        if is_mac "$input_target" 2>/dev/null; then
+            local mac=$(normalize_mac "$input_target")
+            if [ -z "$mac" ]; then
+                echo "WARN: Invalid MAC address: $input_target, skipping"
+                continue
+            fi
+            
+            resolved_ip=$(resolve_mac_to_ip "$mac")
+            if [ -z "$resolved_ip" ]; then
+                echo "WARN: MAC $mac not found in ARP table, skipping"
+                continue
+            fi
+            
+            echo "Resolved MAC $mac -> $resolved_ip"
+            store_format="${mac}=${resolved_ip}"
+        else
+            # Plain IP or subnet
+            resolved_ip="$input_target"
+            store_format="$input_target"
+        fi
+        
+        # Check for conflicts with other interfaces (by resolved IP)
+        local current_owner=$(find_interface_for_ip "$resolved_ip" 2>/dev/null)
+        if [ -n "$current_owner" ] && [ "$current_owner" != "$iface" ]; then
+            echo "Moving $resolved_ip from $current_owner to $iface"
+            # Find the exact target format in the other interface
+            local other_targets=$(db_get_field "$current_owner" "target_ips" 2>/dev/null | tr ',' ' ')
+            for other_target in $other_targets; do
+                local other_resolved=""
+                case "$other_target" in
+                    *=*) other_resolved="${other_target#*=}" ;;
+                    *) other_resolved="$other_target" ;;
+                esac
+                if [ "$other_resolved" = "$resolved_ip" ]; then
+                    cmd_remove_ip "$current_owner" "$other_target"
+                    break
+                fi
+            done
+        fi
+        
+        # Check for duplicates (by resolved IP)
+        local is_dupe=0
+        for existing_resolved in $current_resolved_ips; do
+            if [ "$existing_resolved" = "$resolved_ip" ]; then
+                echo "INFO: $resolved_ip already in target list (duplicate), skipping"
+                is_dupe=1
                 break
             fi
         done
         
-        if [ "$exists" = "0" ]; then
+        if [ "$is_dupe" = "0" ]; then
             [ -n "$new_targets_list" ] && new_targets_list="${new_targets_list},"
-            new_targets_list="${new_targets_list}${ip_to_add}"
+            new_targets_list="${new_targets_list}${store_format}"
+            current_resolved_ips="$current_resolved_ips $resolved_ip"
         fi
     done
     
-    # Use normalized comma-separated list
+    # Normalize to comma-separated
     new_targets_list=$(echo "$new_targets_list" | tr ' ' ',')
     
-    # Assigning targets to interface
     echo "Assigning targets to $iface: $new_targets_list"
     
     # Update database with new targets
-    # Set target_only=1 if interface was already committed (hot-reload path)
     local target_only=0
     is_interface_committed "$iface" && target_only=1
     
