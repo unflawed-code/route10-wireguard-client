@@ -56,6 +56,7 @@ Tested on Route10 firmware version `1.4r`.
 
     ```sh
     Usage: ./wg-pbr.sh <interface_name> -c <config_file> [ -t <IPs> [-r <routing_table>] | -d <domains> ]
+    Usage: ./wg-pbr.sh delete <interface_name>
       Arguments for configuration:
         <interface_name>:   WireGuard interface name (max 11 chars)
         -c, --conf <file>:      Relative or absolute path to the wg conf file
@@ -66,6 +67,7 @@ Tested on Route10 firmware version `1.4r`.
     Commands:
       ./wg-pbr.sh commit               Apply all staged WireGuard interface configurations.
       ./wg-pbr.sh reapply              Re-apply firewall rules for all registered interfaces.
+      ./wg-pbr.sh delete <iface>       Stop and permanently remove a managed interface and all associated rules. Wireguard interfaces not created by wg-pbr.sh will not be deleted.
 
     Target Management (requires 05-manage-commands.sh plugin):
       ./wg-pbr.sh status [iface]             Show detailed status of all or specific interface.
