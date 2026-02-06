@@ -227,7 +227,6 @@ cmd_status() {
     # However, 'printf' usually counts bytes. 
     
     printf "| %-16s | %-51s |\n" "Status" "$iface_status_display"
-    printf "| %-16s | %-51s |\n" "Status" "$iface_status_display"
     
     local mode_padding=52
     if echo "$mode_display" | grep -q "Split-Tunnel"; then
