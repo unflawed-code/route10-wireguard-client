@@ -54,6 +54,12 @@ delete_wg_interface() {
         ifdown "$iface" 2>/dev/null || true
         # Give it a second to run hotplug
         sleep 1
+        
+        # Force delete if still exists (UCI deletion alone doesn't kill kernel device if ifdown fails)
+        if ip link show "$iface" >/dev/null 2>&1; then
+             echo "  Forcefully removing interface $iface..."
+             ip link delete "$iface" 2>/dev/null || true
+        fi
     fi
     
     # 3. Clean up UCI configuration
@@ -92,10 +98,11 @@ delete_wg_interface() {
     local dns_filter6_chain="vpn_dns_filter6_${iface}"
     local dns_block_chain="vpn_dns_block_${iface}"
     local dns_block6_chain="vpn_dns_block6_${iface}"
+    local split_chain="split_${iface}"
     
     # Unlink and flush IPv4 chains
     for table in mangle nat filter; do
-        for chain in $mark_chain $ks_chain $dns_nat_chain $dns_filter_chain $dns_block_chain; do
+        for chain in $mark_chain $ks_chain $dns_nat_chain $dns_filter_chain $dns_block_chain $split_chain; do
             iptables -t $table -F "$chain" 2>/dev/null || true
             iptables -t $table -D PREROUTING -j "$chain" 2>/dev/null || true
             iptables -t $table -D FORWARD -j "$chain" 2>/dev/null || true
@@ -103,11 +110,14 @@ delete_wg_interface() {
             iptables -t $table -D OUTPUT -j "$chain" 2>/dev/null || true
             iptables -t $table -X "$chain" 2>/dev/null || true
         done
+        # Special case for split-tunnel: cleanup any lingering OUTPUT rules by target IP if found
+        # (Though usually iptables -X handles unlinked chains, we explicitly marked OUTPUT 1)
+        iptables -t mangle -D OUTPUT -j "$split_chain" 2>/dev/null || true
     done
     
     # Unlink and flush IPv6 chains
     for table in mangle nat filter; do
-        for chain in $mark_ipv6_chain $ks_chain $block_chain $ipv4_only_block_chain $v6_dns_in_chain $nat66_chain $dns_nat6_chain $dns_filter6_chain $dns_block6_chain; do
+        for chain in $mark_ipv6_chain $ks_chain $block_chain $ipv4_only_block_chain $v6_dns_in_chain $nat66_chain $dns_nat6_chain $dns_filter6_chain $dns_block6_chain $split_chain; do
             ip6tables -t $table -F "$chain" 2>/dev/null || true
             ip6tables -t $table -D PREROUTING -j "$chain" 2>/dev/null || true
             ip6tables -t $table -D FORWARD -j "$chain" 2>/dev/null || true
@@ -115,6 +125,7 @@ delete_wg_interface() {
             ip6tables -t $table -D OUTPUT -j "$chain" 2>/dev/null || true
             ip6tables -t $table -X "$chain" 2>/dev/null || true
         done
+        ip6tables -t mangle -D OUTPUT -j "$split_chain" 2>/dev/null || true
     done
     
     # 5. Clean up routing rules
@@ -134,19 +145,35 @@ delete_wg_interface() {
     echo "  Removing ipsets..."
     ipset destroy "vpn_${iface}" 2>/dev/null || true
     ipset destroy "vpn6_${iface}" 2>/dev/null || true
+    ipset destroy "dst_vpn_${iface}" 2>/dev/null || true
+    ipset destroy "dst6_vpn_${iface}" 2>/dev/null || true
     
-    # 7. Remove hotplug scripts
+    # 7. Clean up Dedicated DNS (Split Tunnel)
+    echo "  Stopping dedicated DNS instance (if any)..."
+    local ded_pid="${wg_tmp_dir}/${iface}-split-dnsmasq.pid"
+    if [ -f "$ded_pid" ]; then
+        local pid=$(cat "$ded_pid")
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$ded_pid" 2>/dev/null || true
+    fi
+    rm -f "${wg_tmp_dir}/${iface}-split-dnsmasq.conf" 2>/dev/null || true
+    rm -f "/tmp/dnsmasq.d/${iface}-split-stub.conf" 2>/dev/null || true
+    
+    # 8. Remove hotplug scripts
     echo "  Removing hotplug scripts..."
     rm -f "/etc/hotplug.d/iface/99-${iface}-routing" 2>/dev/null || true
     rm -f "/etc/hotplug.d/iface/99-${iface}-cleanup" 2>/dev/null || true
+    rm -f "/etc/hotplug.d/iface/99-${iface}-split" 2>/dev/null || true
     
-    # 8. Clean up temporary files
+    # 9. Clean up temporary files
     echo "  Removing temporary state files..."
     rm -f "${wg_tmp_dir}/prefix_${iface}_"* 2>/dev/null || true
     rm -f "${wg_tmp_dir}/ip_${iface}_"* 2>/dev/null || true
     rm -f "/tmp/dnsmasq.d/99-${iface}-dns.conf" 2>/dev/null || true
     
-    # 9. Purge from database
+    # 10. Purge from database
     if [ -f "$db_path" ]; then
         echo "  Purging database entries..."
         sqlite3 "$db_path" "DELETE FROM mac_state WHERE interface = '$iface';" 2>/dev/null || true

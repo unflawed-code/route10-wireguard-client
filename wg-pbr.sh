@@ -11,7 +11,7 @@
 # - Persistent state management across reboots
 #
 
-WG_VERSION="v2.4.0"
+WG_VERSION="v2.5.0"
 export WG_VERSION
 
 set -e
@@ -226,7 +226,9 @@ if [ "$1" = "commit" ]; then
             [ -z "$iface" ] && continue
             
             # Skip split-tunnel configs (has domains) - handled in pass 2
-            [ -n "$domains" ] && [ "$domains" != "" ] && continue
+            if [ -n "$domains" ] && [ "$domains" != "" ] && [ "$domains" != "none" ]; then
+                continue
+            fi
             
             # Convert SQLite integers to shell booleans
             [ "$committed" = "1" ] && committed="true" || committed="false"
@@ -260,13 +262,24 @@ if [ "$1" = "commit" ]; then
             [ -z "$iface" ] && continue
             
             # Skip target-IP configs (no domains) - handled in pass 1
-            [ -z "$domains" ] || [ "$domains" = "" ] && continue
+            if [ -z "$domains" ] || [ "$domains" = "" ] || [ "$domains" = "none" ]; then
+                continue
+            fi
             
             # Convert SQLite integers to shell booleans
             [ "$committed" = "1" ] && committed="true" || committed="false"
+            [ "$target_only" = "1" ] && target_only="true" || target_only="false"
             
-            # Split-tunnel mode
-            if [ "$committed" != "true" ]; then
+            if [ "$target_only" = "true" ] && [ "$committed" = "true" ]; then
+                echo "Hot-reloading domains for $iface..."
+                if "$LIB_DIR/wg-split-tunnel.sh" "$iface" -c "$conf" -d "$domains" -r "$rt"; then
+                    echo "$iface" >> "${WG_TMP_DIR}/split_tunnel_ifaces.tmp"
+                    # Reset target_only flag in database
+                    db_set_target_only "$iface" 0
+                else
+                    echo "Error hot-reloading domains for $iface"
+                fi
+            elif [ "$committed" != "true" ]; then
                 echo "Applying split-tunnel for $iface (domains: $domains)..."
                 if "$LIB_DIR/wg-split-tunnel.sh" "$iface" -c "$conf" -d "$domains" -r "$rt"; then
                     db_commit_interface "$iface"
@@ -1508,11 +1521,11 @@ if [ "$IPV6_SUPPORTED" = "1" ]; then
 
 fi
 
-ip rule del fwmark $MARK_VALUE table $ROUTING_TABLE 2>/dev/null
-ip rule add fwmark $MARK_VALUE table $ROUTING_TABLE priority $((ROUTING_TABLE - 5))
+ip rule del fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE 2>/dev/null
+ip rule add fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE priority $((ROUTING_TABLE - 5))
 if [ "$IPV6_SUPPORTED" = "1" ]; then
-    ip -6 rule del fwmark $MARK_VALUE table $ROUTING_TABLE 2>/dev/null
-    ip -6 rule add fwmark $MARK_VALUE table $ROUTING_TABLE priority $((ROUTING_TABLE - 5))
+    ip -6 rule del fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE 2>/dev/null
+    ip -6 rule add fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE priority $((ROUTING_TABLE - 5))
 fi
 
 # Discover and configure existing clients
@@ -1629,7 +1642,7 @@ logger -t wireguard "[$WG_INTERFACE] Updated interface start_time in SQLite."
 
 # Add a final dnsmasq reload to ensure it binds to the ipset
 logger -t wireguard "[$WG_INTERFACE] Performing guaranteed dnsmasq reload."
-( /etc/init.d/dnsmasq reload >/dev/null 2>&1 ) &
+/etc/init.d/dnsmasq restart >/dev/null 2>&1
 
 EOF_IFACE_ROUTING
 
@@ -1764,8 +1777,8 @@ done
 
 # Clean up firewall mark rules
 logger -t wireguard "[$WG_INTERFACE] Cleaning up DNS leak-prevention firewall mark $MARK_VALUE."
-ip rule del fwmark $MARK_VALUE table $ROUTING_TABLE 2>/dev/null
-ip -6 rule del fwmark $MARK_VALUE table $ROUTING_TABLE 2>/dev/null
+ip rule del fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE 2>/dev/null
+ip -6 rule del fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE 2>/dev/null
 
 lan_ifaces=$(get_lan_ifaces)
 for lan_if in $lan_ifaces; do
@@ -1844,7 +1857,7 @@ ipset destroy $IPSET_NAME 2>/dev/null
 ipset destroy $IPSET_NAME_V6 2>/dev/null
 
 # Reload dnsmasq to apply changes (remove config)
-( /etc/init.d/dnsmasq reload >/dev/null 2>&1 ) &
+/etc/init.d/dnsmasq restart >/dev/null 2>&1
 
 # Clean up IPv6 prefix state files
 WG_TMP_DIR="/tmp/wg-custom"

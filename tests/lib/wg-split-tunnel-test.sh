@@ -40,14 +40,26 @@ else
     echo "[WARN] Handshake might be stale (last: $AGE seconds ago)"
 fi
 
-# 3. Routing Rules
+# 4. Routing Rules
 # Get routing table ID from database
 ROUTING_TABLE=$(sqlite3 "/tmp/wg-custom/wg_pbr.db" "SELECT routing_table FROM interfaces WHERE name='$INTERFACE';" 2>/dev/null)
 
-if [ -n "$ROUTING_TABLE" ] && ip rule show | grep -q "lookup $ROUTING_TABLE"; then
-    echo "[PASS] PBR Routing rules (table $ROUTING_TABLE) exist"
+if [ -n "$ROUTING_TABLE" ]; then
+    # Get the expected mark for this interface
+    MARK=$((0x10000 + ROUTING_TABLE))
+    MASKED_MARK_HEX=$(printf "0x%x/0x%x" "$MARK" "$MARK")
+    
+    # Check if a rule exists for this masked mark pointing to the correct table
+    if ip rule show | grep -q "fwmark $MASKED_MARK_HEX lookup $ROUTING_TABLE"; then
+        echo "[PASS] Masked PBR Routing rules (mark $MASKED_MARK_HEX -> table $ROUTING_TABLE) exist"
+    else
+        echo "[FAIL] Masked PBR Routing rules for table $ROUTING_TABLE missing or incorrect format!"
+        echo "       Expected: fwmark $MASKED_MARK_HEX lookup $ROUTING_TABLE"
+        echo "       Current rules:"
+        ip rule show | grep "lookup $ROUTING_TABLE"
+    fi
 else
-    echo "[FAIL] PBR Routing rules for table $ROUTING_TABLE missing!"
+    echo "[FAIL] Could not find routing table for $INTERFACE in database"
 fi
 
 # Check for OUTPUT chain DNS marking (split-tunnel uses INSERT at position 1 for priority)

@@ -26,8 +26,10 @@ show_plugin_help() {
     echo ""
     echo "Management Commands (via plugin):"
     echo "  $0 status [interface]            Show status of managed interface(s)"
-    echo "  $0 assign-ips <interface> <ips>  Add target IPs (comma-separated, accumulates until commit)"
-    echo "  $0 remove-ips <interface> <ips>  Remove target IPs (comma-separated, accumulates until commit)"
+    echo "  $0 assign-ips <interface> <ips>      Add target IPs (comma-separated, accumulates until commit)"
+    echo "  $0 remove-ips <interface> <ips>      Remove target IPs (comma-separated, accumulates until commit)"
+    echo "  $0 assign-domains <iface> <domains>  Add split-tunnel domains (comma-separated, accumulates until commit)"
+    echo "  $0 remove-domains <iface> <domains>  Remove split-tunnel domains (comma-separated, accumulates until commit)"
 }
 
 # Hook: Handle custom commands
@@ -50,6 +52,16 @@ handle_command() {
         assign-ips)
             [ -z "$2" ] || [ -z "$3" ] && echo "Error: assign-ips requires interface and IP(s)" && return 1
             cmd_assign_ip "$2" "$3"
+            return $?
+            ;;
+        assign-domains)
+            [ -z "$2" ] || [ -z "$3" ] && echo "Error: assign-domains requires interface and domain(s)" && return 1
+            cmd_assign_domains "$2" "$3"
+            return $?
+            ;;
+        remove-domains)
+            [ -z "$2" ] || [ -z "$3" ] && echo "Error: remove-domains requires interface and domain(s)" && return 1
+            cmd_remove_domains "$2" "$3"
             return $?
             ;;
     esac
@@ -209,22 +221,37 @@ cmd_status() {
     # Interface section
     # Label col: 16 visual | Value col: 50 visual
     # Compensation for multi-byte emojis in 2nd column
-    printf "| %-16s | %-51s |\n" "Status" "$iface_status_display"
-    printf "| %-16s | %-52s |\n" "Mode" "$mode_display"
+    # Emojis like 🔗, ✅, 🛡️ take more space than 1 char visually but sometimes count as multiple bytes
+    # Status: 'Active ✅' -> 6 chars text + 1 char space + emoji. 
+    # To align with 50-char width: %-50s works if the emoji is treated correctly.
+    # However, 'printf' usually counts bytes. 
     
-    # Calculate padding for Uptime based on emoji presence (⏱️ is 6 bytes but 2 columns)
+    printf "| %-16s | %-51s |\n" "Status" "$iface_status_display"
+    printf "| %-16s | %-51s |\n" "Status" "$iface_status_display"
+    
+    local mode_padding=52
+    if echo "$mode_display" | grep -q "Split-Tunnel"; then
+         mode_padding=55
+    fi
+    printf "| %-16s | %-${mode_padding}s |\n" "Mode" "$mode_display"
+    
+    # Calculate padding for Uptime based on emoji presence (⏱️ is ~6 bytes but 2 columns)
     local uptime_padding=50
     if echo "$uptime_str" | grep -q "⏱️"; then
         uptime_padding=54
     fi
     printf "| %-16s | %-${uptime_padding}s |\n" "Uptime" "$uptime_str"
     
-    printf "| %-16s | %-51s |\n" "Staged" "$([ "$committed" = "1" ] && echo "Committed ✅" || echo "Pending ⏳")"
+    # Staged row - emojis used
+    local staged_display="$([ "$committed" = "1" ] && echo "Committed ✅" || echo "Pending ⏳")"
+    printf "| %-16s | %-51s |\n" "Staged" "$staged_display"
     
     # Network section
     echo "+------------------+----------------------------------------------------+"
     printf "| %-16s | %-50s |\n" "Routing Table" "$rt (${iface}_rt)"
-    printf "| %-16s | %-51s |\n" "IPv6 Support" "$([ "$ipv6" = "1" ] && echo "Yes ✅" || echo "No ❌")"
+    
+    local ipv6_display="$([ "$ipv6" = "1" ] && echo "Yes ✅" || echo "No ❌")"
+    printf "| %-16s | %-51s |\n" "IPv6 Support" "$ipv6_display"
     [ "$nat66" = "1" ] && printf "| %-16s | %-51s |\n" "NAT66" "Enabled ✅"
     [ -n "$pub_ipv4" ] && printf "| %-16s | %-50s |\n" "Public IPv4" "$pub_ipv4"
     [ -n "$pub_ipv6" ] && printf "| %-16s | %-50s |\n" "Public IPv6" "$pub_ipv6"
@@ -241,6 +268,7 @@ cmd_status() {
                 printf "| %-16s | %-50s |\n" "" "$domain"
             fi
         done
+        [ "$first" = "1" ] && printf "| %-16s | %-50s |\n" "Domains" "(None)"
     else
         if [ -n "$vpn_ips" ] && [ "$vpn_ips" != "" ] && [ "$vpn_ips" != "none" ]; then
             local first=1
@@ -538,5 +566,139 @@ cmd_assign_ip() {
     db_update_staged_targets "$iface" "$new_targets_list" "$target_only"
     
     echo "Staged updated configuration for $iface"
+    echo "Run './wg-pbr.sh commit' to apply changes"
+}
+
+# ASSIGN-DOMAINS command - Accumulates domains for split-tunnel interfaces
+cmd_assign_domains() {
+    local iface="$1"
+    local input_list="$2"
+    
+    # Get current staged entry from SQLite
+    local db_entry=$(db_get_interface "$iface" 2>/dev/null)
+    if [ -z "$db_entry" ]; then
+        echo "Error: Interface $iface not found in database"
+        return 1
+    fi
+    
+    # Validation: Verify interface is in split-tunnel mode
+    local targets=$(echo "$db_entry" | cut -d'|' -f4)
+    local current_domains=$(echo "$db_entry" | cut -d'|' -f5)
+    
+    if [ "$targets" != "none" ] && [ -n "$targets" ]; then
+        echo "Error: Cannot assign domains to IP-routing interface $iface"
+        echo "This interface is configured to route by IP/MAC: $targets"
+        return 1
+    fi
+    
+    echo "Updating domains for $iface (Split-Tunnel mode)"
+    
+    [ "$current_domains" = "none" ] && current_domains=""
+    
+    # Build unique list of domains
+    local new_list="$current_domains"
+    # Replace commas with spaces safely
+    local input_domains=$(echo "$input_list" | tr ',' ' ')
+    
+    for domain in $input_domains; do
+        # Convert to lowercase
+        local domain_clean=$(echo "$domain" | tr A-Z a-z)
+        
+        # Trim whitespace using shell parameter expansion (safer than external function/pipes)
+        # Remove leading whitespace
+        domain_clean="${domain_clean#"${domain_clean%%[![:space:]]*}"}"
+        # Remove trailing whitespace  
+        domain_clean="${domain_clean%"${domain_clean##*[![:space:]]}"}"
+        
+        [ -z "$domain_clean" ] && continue
+        
+        # Check if already exists (safe matching with commas)
+        case ",$new_list," in
+            *",${domain_clean},"*)
+                echo "Info: $domain_clean already in list."
+                ;;
+            *)
+                if [ -n "$new_list" ]; then
+                    new_list="${new_list},${domain_clean}"
+                else
+                    new_list="${domain_clean}"
+                fi
+                echo "Staging addition: $domain_clean"
+                ;;
+        esac
+    done
+    
+    # Update database
+    local target_only=0
+    is_interface_committed "$iface" && target_only=1
+    db_update_staged_domains "$iface" "$new_list" "$target_only"
+    
+    echo "Staged updated domain configuration for $iface"
+    echo "Run './wg-pbr.sh commit' to apply changes"
+}
+
+# REMOVE-DOMAINS command - Removes domains from split-tunnel interfaces
+cmd_remove_domains() {
+    local iface="$1"
+    local input_list="$2"
+    
+    # Get current staged entry from SQLite
+    local db_entry=$(db_get_interface "$iface" 2>/dev/null)
+    if [ -z "$db_entry" ]; then
+        echo "Error: Interface $iface not found in database"
+        return 1
+    fi
+    
+    local current_domains=$(echo "$db_entry" | cut -d'|' -f5)
+    if [ -z "$current_domains" ]; then
+        echo "Error: No domains configured for $iface"
+        return 1
+    fi
+    
+    local new_list=""
+    local removed_count=0
+    # Process removals safely
+    local to_remove_list=$(echo "$input_list" | tr ',' ' ')
+    local keep_list=""
+    
+    # Iterate through current domains
+    for current in $(echo "$current_domains" | tr ',' ' '); do
+        local keep=1
+        for remove_item in $to_remove_list; do
+            # normalize remove item
+            local clean_remove=$(echo "$remove_item" | tr A-Z a-z)
+            # trim
+            clean_remove="${clean_remove#"${clean_remove%%[![:space:]]*}"}"
+            clean_remove="${clean_remove%"${clean_remove##*[![:space:]]}"}"
+            
+            if [ "$current" = "$clean_remove" ]; then
+                keep=0
+                removed_count=$((removed_count + 1))
+                echo "Staging removal: $current"
+                break
+            fi
+        done
+        
+        if [ "$keep" -eq 1 ]; then
+            if [ -n "$keep_list" ]; then
+                keep_list="${keep_list},${current}"
+            else
+                keep_list="${current}"
+            fi
+        fi
+    done
+    new_list="$keep_list"
+    
+    if [ $removed_count -eq 0 ]; then
+        echo "Warning: None of the specified domains were found in $iface"
+        return 0
+    fi
+    
+    # Update database
+    local target_only=0
+    is_interface_committed "$iface" && target_only=1
+    db_update_staged_domains "$iface" "$new_list" "$target_only"
+    
+    echo "Staged updated domain configuration for $iface ($removed_count removed)"
     echo "Run './wg-pbr.sh commit' to apply changes"
 }

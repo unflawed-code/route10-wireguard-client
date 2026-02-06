@@ -2,7 +2,7 @@
 
 This project provides a robust, script-based solution for managing WireGuard interfaces on Route10 (OpenWrt based) routers, with a focus on Policy-Based Routing (PBR). It allows you to selectively route specific clients or subnets through different WireGuard tunnels while maintaining direct internet access for others.
 
-Tested on Route10 firmware version `1.4r`.
+Tested on Route10 firmware version `1.4s`.
 
 ## Key Features
 
@@ -73,6 +73,8 @@ Tested on Route10 firmware version `1.4r`.
       ./wg-pbr.sh status [iface]             Show detailed status of all or specific interface.
       ./wg-pbr.sh assign-ips <iface> <IPs>   Add IPs/subnets/MACs to an interface (accumulates until commit).
       ./wg-pbr.sh remove-ips <iface> <IPs>   Remove IPs/subnets/MACs from an interface (accumulates until commit).
+      ./wg-pbr.sh assign-domains <iface> <D> Add domains for split-tunnel (accumulates until commit).
+      ./wg-pbr.sh remove-domains <iface> <D> Remove domains for split-tunnel (accumulates until commit).
     ```
 
     ```sh

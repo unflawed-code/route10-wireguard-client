@@ -216,10 +216,24 @@ setup_interface
 # === DNS VALIDATION ===
 
 setup_dns_stub() {
+    # Ensure main dnsmasq includes /tmp/dnsmasq.d for stubs
+    local confdir=$(uci -q get dhcp.@dnsmasq[0].confdir)
+    # Check if we need to add the include directory
+    if ! echo "$confdir" | grep -q "/tmp/dnsmasq.d"; then
+         log "Configuring dnsmasq to include /tmp/dnsmasq.d..."
+         uci add_list dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d'
+         uci commit dhcp
+         /etc/init.d/dnsmasq restart
+    fi
+
+    # Create the directory
+    mkdir -p "/tmp/dnsmasq.d"
+
     # === MAIN DNSMASQ STUB GENERATION ===
     # Tell Main Dnsmasq to forward these domains to our dedicated instance (127.0.0.1#PORT)
     # Also include the ipset directives in the MAIN instance so it populates the sets
     MAIN_STUB_CONF="/tmp/dnsmasq.d/${INTERFACE}-split-stub.conf"
+    
     
     # Cleanup legacy config (prevent pollution)
     rm -f "/tmp/dnsmasq.d/${INTERFACE}-split.conf"
@@ -242,7 +256,7 @@ setup_dns_stub() {
     done
     IFS="$old_ifs"
     
-    # Note: dnsmasq reload is handled by wg-pbr.sh commit (once after all interfaces)
+    # Note: dnsmasq restart is handled by wg-pbr.sh commit (once all stubs are ready)
 }
 
 setup_dns() {
@@ -425,11 +439,11 @@ setup_pbr() {
     fi
     
     # 2. IP Rules - lookup table based on fwmark (priority 50 = high priority)
-    ip rule del fwmark "$MARK" table "$ROUTING_TABLE" 2>/dev/null || true
-    ip rule add fwmark "$MARK" table "$ROUTING_TABLE" priority 50
+    ip rule del fwmark "$MARK/$MARK" table "$ROUTING_TABLE" 2>/dev/null || true
+    ip rule add fwmark "$MARK/$MARK" table "$ROUTING_TABLE" priority 50
     if [ "$IPV6_SUPPORTED" = "1" ]; then
-        ip -6 rule del fwmark "$MARK" table "$ROUTING_TABLE" 2>/dev/null || true
-        ip -6 rule add fwmark "$MARK" table "$ROUTING_TABLE" priority 50
+        ip -6 rule del fwmark "$MARK/$MARK" table "$ROUTING_TABLE" 2>/dev/null || true
+        ip -6 rule add fwmark "$MARK/$MARK" table "$ROUTING_TABLE" priority 50
     fi
     
     # 2b. DNS Routing - REMOVED destination-based rules (caused conflict when multiple interfaces share same DNS)

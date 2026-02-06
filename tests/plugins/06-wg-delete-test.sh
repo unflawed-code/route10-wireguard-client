@@ -24,6 +24,8 @@ cleanup_all() {
     rm -f "$TEST_CONF" 2>/dev/null
     rm -f "/etc/hotplug.d/iface/99-${TEST_IFACE}-routing" 2>/dev/null
     rm -f "/etc/hotplug.d/iface/99-${TEST_IFACE}-cleanup" 2>/dev/null
+    rm -f "/etc/hotplug.d/iface/99-${TEST_IFACE}-split" 2>/dev/null
+    rm -f "/tmp/dnsmasq.d/${TEST_IFACE}-split-stub.conf" 2>/dev/null
 }
 
 # Register cleanup trap
@@ -63,8 +65,15 @@ fi
 uci set network.${TEST_IFACE}=interface 2>/dev/null || true
 touch "/etc/hotplug.d/iface/99-${TEST_IFACE}-routing"
 touch "/etc/hotplug.d/iface/99-${TEST_IFACE}-cleanup"
+touch "/etc/hotplug.d/iface/99-${TEST_IFACE}-split"
 mkdir -p "/tmp/dnsmasq.d"
 touch "/tmp/dnsmasq.d/99-${TEST_IFACE}-dns.conf"
+touch "/tmp/dnsmasq.d/${TEST_IFACE}-split-stub.conf"
+touch "/tmp/wg-custom/${TEST_IFACE}-split-dnsmasq.pid"
+touch "/tmp/wg-custom/${TEST_IFACE}-split-dnsmasq.conf"
+# Mock ipsets
+ipset create "dst_vpn_${TEST_IFACE}" hash:ip 2>/dev/null || true
+ipset create "dst6_vpn_${TEST_IFACE}" hash:ip family inet6 2>/dev/null || true
 
 # --- Test 2: Run delete command ---
 log_info "Running delete command for ${TEST_IFACE}..."
@@ -111,6 +120,58 @@ if [ -f "$WG_DB" ] && ! sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE name
     log_pass "Database record purged"
 else
     log_fail "Database record still exists in SQLite"
+fi
+
+if [ ! -f "/etc/hotplug.d/iface/99-${TEST_IFACE}-split" ]; then
+    log_pass "Split hotplug script removed"
+else
+    log_fail "Split hotplug script still exists"
+fi
+
+if [ ! -f "/tmp/dnsmasq.d/${TEST_IFACE}-split-stub.conf" ]; then
+    log_pass "Split dnsmasq stub removed"
+else
+    log_fail "Split dnsmasq stub still exists"
+fi
+
+if [ ! -f "/tmp/wg-custom/${TEST_IFACE}-split-dnsmasq.pid" ]; then
+    log_pass "Dedicated dnsmasq PID file removed"
+else
+    log_fail "Dedicated dnsmasq PID file still exists"
+fi
+
+if ! ipset list "dst_vpn_${TEST_IFACE}" >/dev/null 2>&1; then
+    log_pass "Split IPset (v4) removed"
+else
+    log_fail "Split IPset (v4) still exists"
+fi
+
+# --- Test 5: Verify forced kernel interface removal ---
+log_info "Testing forced kernel interface removal..."
+
+# 1. Manually create a dummy interface to simulate a stuck WireGuard interface
+ip link add "$TEST_IFACE" type dummy 2>/dev/null || true
+ip link set "$TEST_IFACE" up 2>/dev/null || true
+
+if ! ip link show "$TEST_IFACE" >/dev/null 2>&1; then
+    log_info "Could not create dummy interface. Skipping forced deletion test."
+else
+    # 2. Register it in DB so delete command accepts it
+    if [ -f "$WG_DB" ]; then
+        sqlite3 "$WG_DB" "INSERT OR REPLACE INTO interfaces (name, routing_table) VALUES ('$TEST_IFACE', '$TEST_RT');" 2>/dev/null
+    fi
+    
+    # 3. Run delete
+    ./wg-pbr.sh delete "$TEST_IFACE"
+    
+    # 4. Verify it's gone
+    if ! ip link show "$TEST_IFACE" >/dev/null 2>&1; then
+        log_pass "Kernel interface force-deleted"
+    else
+        log_fail "Kernel interface still exists after delete"
+        # Cleanup
+        ip link delete "$TEST_IFACE" 2>/dev/null || true
+    fi
 fi
 
 # Final summary

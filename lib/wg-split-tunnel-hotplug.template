@@ -39,12 +39,16 @@
     # Remove IP rules
     MARK_PLACEHOLDER="MARK_PLACEHOLDER"
     TABLE="ROUTING_TABLE_PLACEHOLDER"
-    ip rule del fwmark "$MARK_PLACEHOLDER" table "$TABLE" 2>/dev/null || true
-    ip -6 rule del fwmark "$MARK_PLACEHOLDER" table "$TABLE" 2>/dev/null || true
+    ip rule del fwmark "$MARK_PLACEHOLDER/$MARK_PLACEHOLDER" table "$TABLE" 2>/dev/null || true
+    ip -6 rule del fwmark "$MARK_PLACEHOLDER/$MARK_PLACEHOLDER" table "$TABLE" 2>/dev/null || true
+    
+    # Remove IPSets
+    ipset destroy "dst_vpn_INTERFACE_PLACEHOLDER" 2>/dev/null || true
+    ipset destroy "dst6_vpn_INTERFACE_PLACEHOLDER" 2>/dev/null || true
     
     # Remove dnsmasq stub config
     rm -f "/tmp/dnsmasq.d/INTERFACE_PLACEHOLDER-split-stub.conf"
-    /etc/init.d/dnsmasq reload
+    /etc/init.d/dnsmasq restart
     
     logger -t wg-split-tunnel "[INTERFACE_PLACEHOLDER] Cleanup complete"
     exit 0

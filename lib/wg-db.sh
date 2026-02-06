@@ -72,9 +72,9 @@ db_set_running() {
     local start_time="${3:-$(date +%s)}"
     
     if [ "$running" = "1" ]; then
-        sqlite3 "$WG_DB_PATH" "UPDATE interfaces SET running = 1, start_time = $start_time WHERE name = '$name';"
+        sqlite3 "$WG_DB_PATH" "UPDATE interfaces SET running = 1, start_time = $start_time, target_only = 0 WHERE name = '$name';"
     else
-        sqlite3 "$WG_DB_PATH" "UPDATE interfaces SET running = 0 WHERE name = '$name';"
+        sqlite3 "$WG_DB_PATH" "UPDATE interfaces SET running = 0, target_only = 0 WHERE name = '$name';"
     fi
 }
 
@@ -223,7 +223,8 @@ UPDATE interfaces SET
     nat66 = $nat66,
     start_time = $start_time,
     committed = 1,
-    running = 1
+    running = 1,
+    target_only = 0
 WHERE name = '$name';
 EOF
 }
@@ -375,6 +376,15 @@ db_update_staged_targets() {
     local targets="$2"
     local target_only="${3:-0}"
     sqlite3 "$WG_DB_PATH" "UPDATE interfaces SET target_ips = '$targets', target_only = $target_only WHERE name = '$name';"
+}
+
+# Update domains and set target_only flag (for assign-domains/remove-domains)
+# Usage: db_update_staged_domains <name> <domains> <target_only>
+db_update_staged_domains() {
+    local name="$1"
+    local domains="$2"
+    local target_only="${3:-0}"
+    sqlite3 "$WG_DB_PATH" "UPDATE interfaces SET domains = '$domains', target_only = $target_only WHERE name = '$name';"
 }
 
 # Get all used routing tables (for allocation)
