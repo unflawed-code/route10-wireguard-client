@@ -174,10 +174,23 @@ delete_wg_interface() {
     rm -f "/tmp/dnsmasq.d/99-${iface}-dns.conf" 2>/dev/null || true
     
     # 10. Purge from database
+    # 10. Purge from database
     if [ -f "$db_path" ]; then
         echo "  Purging database entries..."
-        sqlite3 "$db_path" "DELETE FROM mac_state WHERE interface = '$iface';" 2>/dev/null || true
-        sqlite3 "$db_path" "DELETE FROM interfaces WHERE name = '$iface';" 2>/dev/null || true
+        # Remove 2>/dev/null to see errors
+        if ! sqlite3 "$db_path" "DELETE FROM mac_state WHERE interface = '$iface';"; then
+            echo "Error: Failed to delete from mac_state"
+        fi
+        if ! sqlite3 "$db_path" "DELETE FROM interfaces WHERE name = '$iface';"; then
+             echo "Error: Failed to delete from interfaces"
+        fi
+        
+        # Verify deletion
+        if sqlite3 "$db_path" "SELECT name FROM interfaces WHERE name = '$iface';" | grep -q "$iface"; then
+             echo "Error: Interface entry still exists in database!"
+        else
+             echo "  Database entry confirmed deleted."
+        fi
     fi
     
     echo "Done - $iface deleted and cleaned up"

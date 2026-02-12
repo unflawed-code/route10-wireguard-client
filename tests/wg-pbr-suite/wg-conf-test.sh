@@ -175,6 +175,34 @@ EOF
     fi
 }
 
+test_mtu_parsing() {
+    local test_file="$TEMP_DIR/mtu.conf"
+    cat > "$test_file" <<EOF
+[Interface]
+PrivateKey = AAAA
+Address = 10.0.0.1/32
+MTU = 1420
+
+[Peer]
+PublicKey = BBBB
+Endpoint = 1.1.1.1:51820
+EOF
+
+    unset PRIVATE_KEY MTU
+    
+    CONFIG_FILE="$test_file"
+    parse_config
+    
+    local errors=0
+    [ "$MTU" = "1420" ] || { echo "  MTU mismatch: '$MTU'"; errors=1; }
+    
+    if [ $errors -eq 0 ]; then
+        log_pass "MTU Parsing"
+    else
+        log_fail "MTU Parsing"
+    fi
+}
+
 # --- MAIN ---
 
 echo "Running WireGuard Config Tests..."
@@ -192,5 +220,6 @@ test_comments
 test_ipv6_endpoint
 test_dual_stack_addresses
 test_preshared_key
+test_mtu_parsing
 
 echo "Done."

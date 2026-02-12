@@ -77,7 +77,14 @@ ipset create "dst6_vpn_${TEST_IFACE}" hash:ip family inet6 2>/dev/null || true
 
 # --- Test 2: Run delete command ---
 log_info "Running delete command for ${TEST_IFACE}..."
-./wg-pbr.sh delete "$TEST_IFACE"
+output=$(./wg-pbr.sh delete "$TEST_IFACE")
+echo "$output"
+
+if echo "$output" | grep -q "Database entry confirmed deleted"; then
+    log_pass "Delete command reported success"
+else
+    log_fail "Delete command did not report success"
+fi
 
 # --- Test 3: Run delete command for unmanaged interface (should fail) ---
 log_info "Testing validation for unmanaged interface..."
@@ -172,6 +179,34 @@ else
         # Cleanup
         ip link delete "$TEST_IFACE" 2>/dev/null || true
     fi
+fi
+
+# --- Test 6: Verify deletion of stale DB entry (User Scenario) ---
+log_info "Testing deletion of stale DB entry..."
+STALE_IFACE="wgstale"
+# Insert stale entry
+sqlite3 "$WG_DB" "INSERT INTO interfaces (name, routing_table, committed) VALUES ('$STALE_IFACE', 252, 1);" 2>/dev/null
+sqlite3 "$WG_DB" "INSERT INTO mac_state (mac, interface, ip, routing_table) VALUES ('00:11:22:33:44:55', '$STALE_IFACE', '10.99.99.99', 252);" 2>/dev/null
+
+# Run delete
+output=$(./wg-pbr.sh delete "$STALE_IFACE")
+if echo "$output" | grep -q "Database entry confirmed deleted"; then
+    log_pass "Stale DB entry deleted successfully"
+else
+    log_fail "Failed to delete stale DB entry"
+fi
+
+# Verify DB is clean
+if sqlite3 "$WG_DB" "SELECT name FROM interfaces WHERE name = '$STALE_IFACE';" 2>/dev/null | grep -q "$STALE_IFACE"; then
+    log_fail "Stale interface record still in DB"
+else
+    log_pass "Stale interface record purged from DB"
+fi
+
+if sqlite3 "$WG_DB" "SELECT mac FROM mac_state WHERE interface = '$STALE_IFACE';" 2>/dev/null | grep -q "00:11:22:33:44:55"; then
+    log_fail "Stale MAC record still in DB"
+else
+    log_pass "Stale MAC record purged from DB"
 fi
 
 # Final summary

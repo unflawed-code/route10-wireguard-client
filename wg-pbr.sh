@@ -11,7 +11,7 @@
 # - Persistent state management across reboots
 #
 
-WG_VERSION="v2.5.0"
+WG_VERSION="v2.6.0"
 export WG_VERSION
 
 set -e
@@ -47,6 +47,8 @@ usage() {
     run_hook show_plugin_help
     exit 1
 }
+
+
 
 trim() {
     echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
@@ -206,6 +208,8 @@ if [ "$1" = "commit" ]; then
     
     # Wait for system to be ready if uptime is less than 60 seconds
     wait_for_system_ready
+    
+
     
     # Check if any interfaces are staged
     staged_list=$(db_list_staged 2>/dev/null)
@@ -383,6 +387,7 @@ fi
 
 if [ "$1" = "reapply" ]; then
     echo "Re-applying firewall rules for all registered WireGuard interfaces..."
+
     db_init 2>/dev/null || true
     
     interfaces=$(db_list_running 2>/dev/null)
@@ -421,6 +426,7 @@ ROUTING_TABLE_OVERRIDE=""
 VPN_IPS_OVERRIDE=""
 SPLIT_TUNNEL_DOMAINS=""
 INTERNAL_EXEC=0
+MTU=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -603,6 +609,9 @@ parse_config() {
                                     DNS_SERVERS="$DNS_SERVERS $dns"
                                 done
                                 ;;
+                            MTU)
+                                MTU="$value"
+                                ;;
                         esac;;
                     Peer)
                         case "$key" in
@@ -766,6 +775,10 @@ rm -f /etc/hotplug.d/iface/99-${INTERFACE_NAME}-cleanup 2>/dev/null
     uci set network.$INTERFACE_NAME.delegate='0'
     uci set network.$INTERFACE_NAME.ra='0'
     uci set network.$INTERFACE_NAME.route_allowed_ips='0'
+    # Apply MTU if specified in config
+    if [ -n "$MTU" ]; then
+        uci set network.$INTERFACE_NAME.mtu="$MTU"
+    fi
     if [ -n "$CLIENT_IP" ]; then for ip in $CLIENT_IP; do uci add_list network.$INTERFACE_NAME.addresses="$ip"; done; fi
 
     # Determine IPv6 support from wg conf
@@ -953,9 +966,9 @@ block_doh_domains() {
 
 setup_secure_dns() {
     local vpn_dns_list="$1"
-    local vpn_ips="$2"
+    # $2 (vpn_ips) is unused in new ipset-based implementation
     local wg_interface="$3"
-    local vpn_ip6_subnets="${4:-}"
+    # $4 (vpn_ip6_subnets) is unused in new ipset-based implementation
 
     [ -z "$vpn_dns_list" ] && return 0
 
@@ -966,7 +979,11 @@ setup_secure_dns() {
     local input_block_chain="vpn_dns_block_${wg_interface}"
     local input_block_chain_v6="vpn_dns_block6_${wg_interface}"
 
-    logger -t wireguard "[$wg_interface] Setting up complete DNS hijacking (IPv4+IPv6)"
+    # Reconstruct IPSET names based on interface
+    local ipset_v4="vpn_${wg_interface}"
+    local ipset_v6="vpn6_${wg_interface}"
+
+    logger -t wireguard "[$wg_interface] Setting up complete DNS hijacking (IPv4+IPv6) via ipset"
 
     # Initialize INPUT block chains (Prevent direct access to Router DNS)
     iptables -N $input_block_chain 2>/dev/null || iptables -F $input_block_chain
@@ -1021,82 +1038,60 @@ setup_secure_dns() {
     vpn_dns_v4=$(echo "$vpn_dns_v4" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     vpn_dns_v6=$(echo "$vpn_dns_v6" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
-    # IPv4 DNS DNAT + Filtering
+    # IPv4 DNS DNAT + Filtering (Using IPSet)
     if [ -n "$vpn_dns_v4" ]; then
-        # Filter VPN_IPS for IPv4 only
-        for target in $vpn_ips; do
-            actual_ip=$(get_ip_from_target "$target")
-            if ! echo "$actual_ip" | grep -q ":"; then
-                vpn_ips_v4="$vpn_ips_v4 $actual_ip"
-            fi
-        done
+        # DNAT DNS queries to VPN DNS (IPv4) - matching ipset
+        if [ "$(echo $vpn_dns_v4 | wc -w)" -eq 1 ]; then
+            iptables -t nat -A $nat_chain -m set --match-set $ipset_v4 src -p udp --dport 53 -j DNAT --to-destination $vpn_dns_v4
+            iptables -t nat -A $nat_chain -m set --match-set $ipset_v4 src -p tcp --dport 53 -j DNAT --to-destination $vpn_dns_v4
+        else
+            local i=0 dns_count=$(echo $vpn_dns_v4 | wc -w)
+            for dns in $vpn_dns_v4; do
+                iptables -t nat -A $nat_chain -m set --match-set $ipset_v4 src -p udp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination $dns
+                iptables -t nat -A $nat_chain -m set --match-set $ipset_v4 src -p tcp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination $dns
+                i=$((i + 1))
+            done
+        fi
 
-        for item in $vpn_ips_v4; do
-            # DNAT DNS queries to VPN DNS (IPv4)
-            if [ "$(echo $vpn_dns_v4 | wc -w)" -eq 1 ]; then
-                iptables -t nat -A $nat_chain -s $item -p udp --dport 53 -j DNAT --to-destination $vpn_dns_v4
-                iptables -t nat -A $nat_chain -s $item -p tcp --dport 53 -j DNAT --to-destination $vpn_dns_v4
-            else
-                local i=0 dns_count=$(echo $vpn_dns_v4 | wc -w)
-                for dns in $vpn_dns_v4; do
-                    iptables -t nat -A $nat_chain -s $item -p udp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination $dns
-                    iptables -t nat -A $nat_chain -s $item -p tcp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination $dns
-                    i=$((i + 1))
-                done
-            fi
+        # Block DoT/DoH (IPv4) - matching ipset
+        iptables -A $filter_chain -m set --match-set $ipset_v4 src -p tcp --dport 853 -j REJECT --reject-with tcp-reset
+        iptables -A $filter_chain -m set --match-set $ipset_v4 src -p udp --dport 853 -j REJECT --reject-with icmp-port-unreachable
 
-            # Block DoT/DoH (IPv4)
-            iptables -A $filter_chain -s $item -p tcp --dport 853 -j REJECT --reject-with tcp-reset
-            iptables -A $filter_chain -s $item -p udp --dport 853 -j REJECT --reject-with icmp-port-unreachable
+        # Dynamically block DoH providers by reading the https-dns-proxy config
+        block_doh_domains iptables $filter_chain "-m set --match-set $ipset_v4 src"
 
-            # Dynamically block DoH providers by reading the https-dns-proxy config
-            block_doh_domains iptables $filter_chain "-s $item"
+        # Block access to local dnsmasq (INPUT) - matching ipset
+        iptables -A $input_block_chain -m set --match-set $ipset_v4 src -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable
+        iptables -A $input_block_chain -m set --match-set $ipset_v4 src -p tcp --dport 53 -j REJECT --reject-with tcp-reset
 
-            # Block access to local dnsmasq (INPUT)
-            iptables -A $input_block_chain -s $item -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable
-            iptables -A $input_block_chain -s $item -p tcp --dport 53 -j REJECT --reject-with tcp-reset
-        done
         iptables -t nat -I PREROUTING 1 -j $nat_chain 2>/dev/null || \
             logger -t wireguard "[$wg_interface] Warning: Could not insert IPv4 NAT chain"
         iptables -I FORWARD 1 -j $filter_chain 2>/dev/null || \
             logger -t wireguard "[$wg_interface] Warning: Could not insert IPv4 filter chain"
     fi
 
-    # IPv6 DNS DNAT + Filtering
+    # IPv6 DNS DNAT + Filtering (Using IPSet)
     if [ -n "$vpn_dns_v6" ] && [ "$IPV6_SUPPORTED" = "1" ]; then
-        # Filter VPN_IPS for IPv6 only and add routable subnets
-        local vpn_ips_v6=""
-        for target in $vpn_ips; do
-            actual_ip=$(get_ip_from_target "$target")
-            if echo "$actual_ip" | grep -q ":"; then
-                vpn_ips_v6="$vpn_ips_v6 $actual_ip"
-            fi
-        done
-        # Append routable subnets
-        if [ -n "$vpn_ip6_subnets" ]; then
-            vpn_ips_v6="$vpn_ips_v6 $vpn_ip6_subnets"
+        # DNAT DNS queries to VPN DNS (IPv6) - matching ipset
+        if [ "$(echo $vpn_dns_v6 | wc -w)" -eq 1 ]; then
+            ip6tables -t nat -A $nat_chain_v6 -m set --match-set $ipset_v6 src -p udp --dport 53 -j DNAT --to-destination $vpn_dns_v6
+            ip6tables -t nat -A $nat_chain_v6 -m set --match-set $ipset_v6 src -p tcp --dport 53 -j DNAT --to-destination $vpn_dns_v6
+        else
+            local i=0 dns_count=$(echo $vpn_dns_v6 | wc -w)
+            for dns in $vpn_dns_v6; do
+                ip6tables -t nat -A $nat_chain_v6 -m set --match-set $ipset_v6 src -p udp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination "[$dns]"
+                ip6tables -t nat -A $nat_chain_v6 -m set --match-set $ipset_v6 src -p tcp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination "[$dns]"
+                i=$((i + 1))
+            done
         fi
 
-        for item in $vpn_ips_v6; do
-            # DNAT DNS queries to VPN DNS (IPv6)
-            if [ "$(echo $vpn_dns_v6 | wc -w)" -eq 1 ]; then
-                ip6tables -t nat -A $nat_chain_v6 -s $item -p udp --dport 53 -j DNAT --to-destination $vpn_dns_v6
-                ip6tables -t nat -A $nat_chain_v6 -s $item -p tcp --dport 53 -j DNAT --to-destination $vpn_dns_v6
-            else
-                local i=0 dns_count=$(echo $vpn_dns_v6 | wc -w)
-                for dns in $vpn_dns_v6; do
-                    ip6tables -t nat -A $nat_chain_v6 -s $item -p udp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination "[$dns]"
-                    ip6tables -t nat -A $nat_chain_v6 -s $item -p tcp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination "[$dns]"
-                    i=$((i + 1))
-                done
-            fi
+        # Block access to local dnsmasq (INPUT) - matching ipset
+        ip6tables -A $input_block_chain_v6 -m set --match-set $ipset_v6 src -p udp --dport 53 -j REJECT --reject-with icmp6-port-unreachable
+        ip6tables -A $input_block_chain_v6 -m set --match-set $ipset_v6 src -p tcp --dport 53 -j REJECT --reject-with tcp-reset
 
-            # Block access to local dnsmasq (INPUT)
-            ip6tables -A $input_block_chain_v6 -s $item -p udp --dport 53 -j REJECT --reject-with icmp6-port-unreachable
-            ip6tables -A $input_block_chain_v6 -s $item -p tcp --dport 53 -j REJECT --reject-with tcp-reset
-        done
-
-        # Block DoT/DoH (IPv6) - apply broadly
+        # Block DoT/DoH (IPv6) - apply broadly (or scoped to ipset if desired, broadly matches existing logic)
+        # Existing logic was broad (no src match), but we should scope it if we want consistency.
+        # However, keeping it broad for now as per previous implementation logic.
         ip6tables -A $filter_chain_v6 -p tcp --dport 853 -j REJECT --reject-with tcp-reset
         ip6tables -A $filter_chain_v6 -p udp --dport 853 -j REJECT --reject-with icmp6-port-unreachable
         # Dynamically block DoH providers by reading the https-dns-proxy config
@@ -1106,7 +1101,7 @@ setup_secure_dns() {
         ip6tables -I FORWARD 1 -j $filter_chain_v6
     fi
 
-    logger -t wireguard "[$wg_interface] Complete DNS hijacking configured (IPv4+IPv6)"
+    logger -t wireguard "[$wg_interface] Complete DNS hijacking configured (IPv4+IPv6) via ipset"
 }
 
 apply_ipv6_rules() {
@@ -1547,7 +1542,7 @@ for target in $VPN_IPS; do
                 while read -r exp mac ip host; do
                     if is_in_subnet "$ip" "$actual_ip" && ! echo "$PROCESSED_MACS" | grep -q "$mac"; then
                         PROCESSED_MACS="$PROCESSED_MACS $mac"
-                        logger -t wireguard "[$WG_INTERFACE] Found existing client $ip ($mac) in $actual_ip via DHCP lease."
+
                         ip rule add from $ip table $ROUTING_TABLE priority $ROUTING_TABLE 2>/dev/null
                         handle_client_ipv6 "$mac" "$ip" "$ip"
                     fi
@@ -1561,7 +1556,7 @@ for target in $VPN_IPS; do
                 mac=$(echo $line | grep -o -E '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
                 if [ -n "$mac" ] && is_in_subnet "$ip" "$actual_ip" && ! echo "$PROCESSED_MACS" | grep -q "$mac"; then
                     PROCESSED_MACS="$PROCESSED_MACS $mac"
-                    logger -t wireguard "[$WG_INTERFACE] Found existing client $ip ($mac) in $actual_ip via ARP/NDP table."
+
                     ip rule add from $ip table $ROUTING_TABLE priority $ROUTING_TABLE 2>/dev/null
                     handle_client_ipv6 "$mac" "$ip" "$ip"
                 fi
@@ -1576,7 +1571,7 @@ for target in $VPN_IPS; do
             mac=$(discover_mac_for_ip "$actual_ip" || true)
             
             if [ -n "$mac" ] && ! echo "$PROCESSED_MACS" | grep -q "$mac"; then
-                logger -t wireguard "[$WG_INTERFACE] Found existing client $actual_ip ($mac)."
+
                 handle_client_ipv6 "$mac" "$actual_ip" "$actual_ip"
             fi
             ;;
@@ -1592,13 +1587,13 @@ if [ -f "$WG_DB_PATH" ] && [ "$IPV6_SUPPORTED" = "1" ]; then
     sqlite3 -separator '|' "$WG_DB_PATH" "SELECT mac, interface, ip, routing_table, ipv6_support FROM mac_state WHERE interface = '$WG_INTERFACE';" 2>/dev/null | \
     while IFS='|' read -r mac iface ip rt ipv6_sup; do
         # Debug: log what we're comparing
-        logger -t wireguard "[$WG_INTERFACE] DEBUG: MAC=$mac IFACE=$iface (expect $WG_INTERFACE)"
+
         # Only restore for THIS interface
         if [ "$iface" = "$WG_INTERFACE" ] && [ -n "$mac" ]; then
             # Check if we already processed this MAC (avoid duplicates)
             if ! echo "$PROCESSED_MACS" | grep -q "$mac"; then
                 PROCESSED_MACS="$PROCESSED_MACS $mac"
-                logger -t wireguard "[$WG_INTERFACE] Restoring rules for MAC $mac (IP: $ip) from state file"
+
                 
                 # Re-add fwmark marking rule if not present
                 if ! ip6tables -t mangle -C $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE 2>/dev/null; then
@@ -1818,7 +1813,7 @@ ip6tables -C FORWARD -j $KS_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $KS_C
 if [ "$VPN_IPS" != "none" ]; then
 for target in $VPN_IPS; do
     actual_ip=$(get_ip_from_target "$target")
-    logger -t wireguard "[$WG_INTERFACE] Blocking all traffic from $actual_ip."
+
     iptables -A $KS_CHAIN -s $actual_ip -j REJECT --reject-with icmp-host-prohibited
     case "$actual_ip" in
         */*) # For subnets, find all known MACs and block them for IPv6
