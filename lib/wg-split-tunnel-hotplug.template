@@ -27,14 +27,14 @@
     
     # Clean up firewall chains
     SPLIT_CHAIN="split_INTERFACE_PLACEHOLDER"
-    iptables -t mangle -F "$SPLIT_CHAIN" 2>/dev/null || true
-    iptables -t mangle -X "$SPLIT_CHAIN" 2>/dev/null || true
-    ip6tables -t mangle -F "$SPLIT_CHAIN" 2>/dev/null || true
-    ip6tables -t mangle -X "$SPLIT_CHAIN" 2>/dev/null || true
+    iptables -w -t mangle -F "$SPLIT_CHAIN" 2>/dev/null || true
+    iptables -w -t mangle -X "$SPLIT_CHAIN" 2>/dev/null || true
+    ip6tables -w -t mangle -F "$SPLIT_CHAIN" 2>/dev/null || true
+    ip6tables -w -t mangle -X "$SPLIT_CHAIN" 2>/dev/null || true
     
     # Remove from PREROUTING
-    iptables -t mangle -D PREROUTING -j "$SPLIT_CHAIN" 2>/dev/null || true
-    ip6tables -t mangle -D PREROUTING -j "$SPLIT_CHAIN" 2>/dev/null || true
+    iptables -w -t mangle -D PREROUTING -j "$SPLIT_CHAIN" 2>/dev/null || true
+    ip6tables -w -t mangle -D PREROUTING -j "$SPLIT_CHAIN" 2>/dev/null || true
     
     # Remove IP rules
     MARK_PLACEHOLDER="MARK_PLACEHOLDER"

@@ -369,43 +369,43 @@ setup_firewall() {
     # Cleanup existing rules to prevent duplicates
     for proto in iptables ip6tables; do
         # NAT (v4/v6)
-        while $proto -t nat -D POSTROUTING -o "$INTERFACE" -j MASQUERADE 2>/dev/null; do :; done
+        while $proto -w -t nat -D POSTROUTING -o "$INTERFACE" -j MASQUERADE 2>/dev/null; do :; done
         
         # Forwarding
-        while $proto -D FORWARD -o "$INTERFACE" -j ACCEPT 2>/dev/null; do :; done
-        while $proto -D FORWARD -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+        while $proto -w -D FORWARD -o "$INTERFACE" -j ACCEPT 2>/dev/null; do :; done
+        while $proto -w -D FORWARD -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
         
         # Output/Input
-        while $proto -D OUTPUT -o "$INTERFACE" -j ACCEPT 2>/dev/null; do :; done
-        while $proto -D INPUT -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+        while $proto -w -D OUTPUT -o "$INTERFACE" -j ACCEPT 2>/dev/null; do :; done
+        while $proto -w -D INPUT -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
         
         # MSS Clamping
-        while $proto -t mangle -D FORWARD -p tcp -o "$INTERFACE" --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
+        while $proto -w -t mangle -D FORWARD -p tcp -o "$INTERFACE" --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
     done
     
     # 1. Masquerade (NAT) - Required for routing to work
-    iptables -t nat -A POSTROUTING -o "$INTERFACE" -j MASQUERADE
-    ip6tables -t nat -A POSTROUTING -o "$INTERFACE" -j MASQUERADE
+    iptables -w -t nat -A POSTROUTING -o "$INTERFACE" -j MASQUERADE
+    ip6tables -w -t nat -A POSTROUTING -o "$INTERFACE" -j MASQUERADE
     
     # 2. Forwarding Rules - Insert at TOP to ensure they are hit
     # Allow LAN -> VPN
-    iptables -I FORWARD 1 -o "$INTERFACE" -j ACCEPT
-    ip6tables -I FORWARD 1 -o "$INTERFACE" -j ACCEPT
+    iptables -w -I FORWARD 1 -o "$INTERFACE" -j ACCEPT
+    ip6tables -w -I FORWARD 1 -o "$INTERFACE" -j ACCEPT
     
     # Allow VPN -> LAN (Related/Established)
-    iptables -I FORWARD 1 -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    ip6tables -I FORWARD 1 -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -w -I FORWARD 1 -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    ip6tables -w -I FORWARD 1 -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     
     # 3. Output/Input Rules (Router <-> VPN) - Insert at TOP to ensure they are hit (fix for EPERM/Ping)
-    iptables -I OUTPUT 1 -o "$INTERFACE" -j ACCEPT
-    ip6tables -I OUTPUT 1 -o "$INTERFACE" -j ACCEPT
+    iptables -w -I OUTPUT 1 -o "$INTERFACE" -j ACCEPT
+    ip6tables -w -I OUTPUT 1 -o "$INTERFACE" -j ACCEPT
     
-    iptables -I INPUT 1 -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    ip6tables -I INPUT 1 -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -w -I INPUT 1 -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    ip6tables -w -I INPUT 1 -i "$INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     
     # 4. MSS Clamping (Fixes huge packet / HTTP timeout issues)
-    iptables -t mangle -A FORWARD -p tcp -o "$INTERFACE" --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-    ip6tables -t mangle -A FORWARD -p tcp -o "$INTERFACE" --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    iptables -w -t mangle -A FORWARD -p tcp -o "$INTERFACE" --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ip6tables -w -t mangle -A FORWARD -p tcp -o "$INTERFACE" --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 }
 
 setup_firewall
@@ -451,23 +451,23 @@ setup_pbr() {
     # DNS servers with this interface's mark, then uses the existing fwmark routing rules.
     
     # 3. Mangle Chain Setup (always create IPv6 chain for DROP rules even if no IPv6 support)
-    iptables -t mangle -N "$split_chain" 2>/dev/null || iptables -t mangle -F "$split_chain"
-    ip6tables -t mangle -N "$split_chain" 2>/dev/null || ip6tables -t mangle -F "$split_chain"
+    iptables -w -t mangle -N "$split_chain" 2>/dev/null || iptables -w -t mangle -F "$split_chain"
+    ip6tables -w -t mangle -N "$split_chain" 2>/dev/null || ip6tables -w -t mangle -F "$split_chain"
     
     # Remove any existing hooks
-    iptables -t mangle -D PREROUTING -j "$split_chain" 2>/dev/null || true
-    ip6tables -t mangle -D PREROUTING -j "$split_chain" 2>/dev/null || true
+    iptables -w -t mangle -D PREROUTING -j "$split_chain" 2>/dev/null || true
+    ip6tables -w -t mangle -D PREROUTING -j "$split_chain" 2>/dev/null || true
     
     # INSERT at position 1 for HIGHEST PRIORITY
-    iptables -t mangle -I PREROUTING 1 -j "$split_chain"
-    ip6tables -t mangle -I PREROUTING 1 -j "$split_chain"
+    iptables -w -t mangle -I PREROUTING 1 -j "$split_chain"
+    ip6tables -w -t mangle -I PREROUTING 1 -j "$split_chain"
     
     # 4. Chain Rules:
     # Step 0: Skip packets arriving FROM this VPN interface (return traffic)
     # Return traffic should NOT be marked - it needs to go back to clients via LAN
-    iptables -t mangle -A "$split_chain" -i "$INTERFACE" -j RETURN
+    iptables -w -t mangle -A "$split_chain" -i "$INTERFACE" -j RETURN
     if [ "$IPV6_SUPPORTED" = "1" ]; then
-        ip6tables -t mangle -A "$split_chain" -i "$INTERFACE" -j RETURN
+        ip6tables -w -t mangle -A "$split_chain" -i "$INTERFACE" -j RETURN
     fi
     
     # Step 0a: Skip packets from VPN-routed clients (source IP in vpn_* ipsets)
@@ -476,33 +476,33 @@ setup_pbr() {
     for vpn_set in $(ipset list -n | grep '^vpn_' | grep -v '^vpn6_'); do
         # Skip our own destination ipset (dst_vpn_*)
         case "$vpn_set" in dst_vpn_*) continue ;; esac
-        iptables -t mangle -A "$split_chain" -m set --match-set "$vpn_set" src -j RETURN
+        iptables -w -t mangle -A "$split_chain" -m set --match-set "$vpn_set" src -j RETURN
         log "Skipping VPN ipset: $vpn_set (IPv4)"
     done
     # IPv6: Always add VPN skip rules (even if tunnel has no IPv6 support)
     # This prevents VPN clients from being affected by the DROP rule
     for vpn_set in $(ipset list -n | grep '^vpn6_'); do
-        ip6tables -t mangle -A "$split_chain" -m set --match-set "$vpn_set" src -j RETURN
+        ip6tables -w -t mangle -A "$split_chain" -m set --match-set "$vpn_set" src -j RETURN
         log "Skipping VPN ipset: $vpn_set (IPv6)"
     done
     # IPv6: Also skip by MAC address - wg-pbr.sh uses mark_ipv6_* chains with MAC matching
-    for mac in $(ip6tables -t mangle -S 2>/dev/null | grep 'mark_ipv6_' | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | sort -u); do
-        ip6tables -t mangle -A "$split_chain" -m mac --mac-source "$mac" -j RETURN
+    for mac in $(ip6tables -w -t mangle -S 2>/dev/null | grep 'mark_ipv6_' | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | sort -u); do
+        ip6tables -w -t mangle -A "$split_chain" -m mac --mac-source "$mac" -j RETURN
         log "Skipping VPN MAC: $mac (IPv6)"
     done
     
     # Step 0b: Restore OUR mark from conntrack (for established connections)
     # Only restore if connmark matches our specific mark (prevents restoring unrelated marks)
     # This comes AFTER VPN skip to prevent restoring marks for VPN clients
-    iptables -t mangle -A "$split_chain" -m connmark --mark "$MARK" -j CONNMARK --restore-mark
+    iptables -w -t mangle -A "$split_chain" -m connmark --mark "$MARK" -j CONNMARK --restore-mark
     if [ "$IPV6_SUPPORTED" = "1" ]; then
-        ip6tables -t mangle -A "$split_chain" -m connmark --mark "$MARK" -j CONNMARK --restore-mark
+        ip6tables -w -t mangle -A "$split_chain" -m connmark --mark "$MARK" -j CONNMARK --restore-mark
     fi
     
     # Step 0c: If packet already has our mark, ACCEPT it (skip further processing)
-    iptables -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
+    iptables -w -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
     if [ "$IPV6_SUPPORTED" = "1" ]; then
-        ip6tables -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
+        ip6tables -w -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
     fi
     
     # Step 0d: Mark DNS packets destined for THIS interface's DNS servers
@@ -517,22 +517,22 @@ setup_pbr() {
                     # IPv6 DNS
                     if [ "$IPV6_SUPPORTED" = "1" ]; then
                         # PREROUTING (client traffic)
-                        ip6tables -t mangle -A "$split_chain" -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
-                        ip6tables -t mangle -A "$split_chain" -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                        ip6tables -w -t mangle -A "$split_chain" -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                        ip6tables -w -t mangle -A "$split_chain" -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
                         # OUTPUT (router-originated DNS, e.g. dnsmasq queries)
                         # Use INSERT at position 1 to take priority over target-IP interface rules
-                        ip6tables -t mangle -I OUTPUT 1 -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
-                        ip6tables -t mangle -I OUTPUT 1 -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                        ip6tables -w -t mangle -I OUTPUT 1 -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                        ip6tables -w -t mangle -I OUTPUT 1 -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
                     fi
                     ;;
                 *)
                     # IPv4 DNS - PREROUTING (client traffic)
-                    iptables -t mangle -A "$split_chain" -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
-                    iptables -t mangle -A "$split_chain" -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                    iptables -w -t mangle -A "$split_chain" -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                    iptables -w -t mangle -A "$split_chain" -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
                     # IPv4 DNS - OUTPUT (router-originated DNS, e.g. dnsmasq queries)
                     # Use INSERT at position 1 to take priority over target-IP interface rules
-                    iptables -t mangle -I OUTPUT 1 -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
-                    iptables -t mangle -I OUTPUT 1 -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                    iptables -w -t mangle -I OUTPUT 1 -p udp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
+                    iptables -w -t mangle -I OUTPUT 1 -p tcp -d "$dns" --dport 53 -j MARK --set-mark "$MARK"
                     ;;
             esac
         done
@@ -540,25 +540,30 @@ setup_pbr() {
     
     # Step 1: Mark packets matching destination ipset FIRST
     log "Adding global PBR rules for domains (all sources)"
-    iptables -t mangle -A "$split_chain" -m set --match-set "$ipset_v4" dst -j MARK --set-mark "$MARK"
+    iptables -w -t mangle -A "$split_chain" -m set --match-set "$ipset_v4" dst -j MARK --set-mark "$MARK"
+    # Also mark router-originated traffic (OUTPUT)
+    iptables -w -t mangle -I OUTPUT 1 -m set --match-set "$ipset_v4" dst -j MARK --set-mark "$MARK"
+    
     if [ "$IPV6_SUPPORTED" = "1" ]; then
-        ip6tables -t mangle -A "$split_chain" -m set --match-set "$ipset_v6" dst -j MARK --set-mark "$MARK"
+        ip6tables -w -t mangle -A "$split_chain" -m set --match-set "$ipset_v6" dst -j MARK --set-mark "$MARK"
+        # Also mark router-originated traffic (OUTPUT)
+        ip6tables -w -t mangle -I OUTPUT 1 -m set --match-set "$ipset_v6" dst -j MARK --set-mark "$MARK"
     else
         # Block IPv6 traffic to these domains since tunnel has no IPv6 (prevent leak)
-        ip6tables -t mangle -A "$split_chain" -m set --match-set "$ipset_v6" dst -j DROP
+        ip6tables -w -t mangle -A "$split_chain" -m set --match-set "$ipset_v6" dst -j DROP
         log "IPv6 traffic to split-tunnel domains will be blocked (no IPv6 support)"
     fi
     
     # Step 2: Save mark to conntrack
-    iptables -t mangle -A "$split_chain" -m mark --mark "$MARK" -j CONNMARK --save-mark
+    iptables -w -t mangle -A "$split_chain" -m mark --mark "$MARK" -j CONNMARK --save-mark
     if [ "$IPV6_SUPPORTED" = "1" ]; then
-        ip6tables -t mangle -A "$split_chain" -m mark --mark "$MARK" -j CONNMARK --save-mark
+        ip6tables -w -t mangle -A "$split_chain" -m mark --mark "$MARK" -j CONNMARK --save-mark
     fi
     
     # Step 3: ACCEPT marked packets
-    iptables -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
+    iptables -w -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
     if [ "$IPV6_SUPPORTED" = "1" ]; then
-        ip6tables -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
+        ip6tables -w -t mangle -A "$split_chain" -m mark --mark "$MARK" -j ACCEPT
     fi
     
     log "PBR configured: priority 50, DNS priority 49, INSERT position 1, ACCEPT on match"

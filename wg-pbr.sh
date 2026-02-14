@@ -11,7 +11,7 @@
 # - Persistent state management across reboots
 #
 
-WG_VERSION="v2.6.0"
+WG_VERSION="v2.6.1"
 export WG_VERSION
 
 set -e
@@ -47,8 +47,6 @@ usage() {
     run_hook show_plugin_help
     exit 1
 }
-
-
 
 trim() {
     echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
@@ -209,8 +207,6 @@ if [ "$1" = "commit" ]; then
     # Wait for system to be ready if uptime is less than 60 seconds
     wait_for_system_ready
     
-
-    
     # Check if any interfaces are staged
     staged_list=$(db_list_staged 2>/dev/null)
     if [ -n "$staged_list" ]; then
@@ -301,10 +297,11 @@ if [ "$1" = "commit" ]; then
         SPLIT_TUNNEL_IFACES=$(cat "${WG_TMP_DIR}/split_tunnel_ifaces.tmp" 2>/dev/null | tr '\n' ' ')
         rm -f "${WG_TMP_DIR}/new_ifaces.tmp" "${WG_TMP_DIR}/hot_reload_ifaces.tmp" "${WG_TMP_DIR}/split_tunnel_ifaces.tmp"
         
-        # Reload dnsmasq once if any split-tunnel interfaces were configured
+        # Restart dnsmasq once if any split-tunnel interfaces were configured
+        # Using restart instead of reload to ensure ipsets are populated
         if [ -n "$SPLIT_TUNNEL_IFACES" ]; then
-            echo "Reloading dnsmasq for split-tunnel domains..."
-            /etc/init.d/dnsmasq reload
+            echo "Restarting dnsmasq for split-tunnel domains..."
+            /etc/init.d/dnsmasq restart
         fi
         
         # Only bring up newly staged interfaces (don't restart already running ones)
@@ -387,7 +384,6 @@ fi
 
 if [ "$1" = "reapply" ]; then
     echo "Re-applying firewall rules for all registered WireGuard interfaces..."
-
     db_init 2>/dev/null || true
     
     interfaces=$(db_list_running 2>/dev/null)
@@ -928,7 +924,7 @@ handle_client_ipv6() {
         [ -z "$lan_ifaces" ] && lan_ifaces="br-lan"
         for lan_if in $lan_ifaces; do
             # Block unmarked IPv6 traffic (allows fwmark-routed traffic through)
-            ip6tables -I $BLOCK_CHAIN 1 -i $lan_if -m mac --mac-source $mac_addr -m mark ! --mark $MARK_VALUE -j DROP
+            ip6tables -w -I $BLOCK_CHAIN 1 -i $lan_if -m mac --mac-source $mac_addr -m mark ! --mark $MARK_VALUE -j DROP
         done
 
         if [ "$VPN_IP6_NEEDS_NAT66" = "1" ]; then
@@ -940,15 +936,15 @@ handle_client_ipv6() {
     else
         # IPv4-only tunnel: Block IPv6 for this client
         logger -t wireguard "[$WG_INTERFACE] Blocking IPv6 for $log_prefix ($mac_addr) on IPv4-only tunnel."
-        ip6tables -A $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac_addr -j DROP
+        ip6tables -w -A $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac_addr -j DROP
         # ALSO Block IPv6 acquisition (RS and DHCPv6) to prevent persistence
-        ip6tables -A INPUT -m mac --mac-source $mac_addr -p icmpv6 --icmpv6-type 133 -j DROP
-        ip6tables -A INPUT -m mac --mac-source $mac_addr -p udp --dport 547 -j DROP
+        ip6tables -w -A INPUT -m mac --mac-source $mac_addr -p icmpv6 --icmpv6-type 133 -j DROP
+        ip6tables -w -A INPUT -m mac --mac-source $mac_addr -p udp --dport 547 -j DROP
     fi
     
     # Block IPv6 DNS to router for this client (both modes)
-    ip6tables -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac_addr -p udp --dport 53 -j REJECT
-    ip6tables -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac_addr -p tcp --dport 53 -j REJECT
+    ip6tables -w -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac_addr -p udp --dport 53 -j REJECT
+    ip6tables -w -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac_addr -p tcp --dport 53 -j REJECT
 }
 
 block_doh_domains() {
@@ -960,15 +956,15 @@ block_doh_domains() {
     
     local domains=$(grep 'resolver_url' /etc/config/https-dns-proxy | awk -F'/' '{print $3}')
     for domain in $domains; do
-        $ipt_cmd -A $chain $src -p tcp --dport 443 -m string --algo bm --string "$domain" -j REJECT --reject-with tcp-reset
+        $ipt_cmd -w -A $chain $src -p tcp --dport 443 -m string --algo bm --string "$domain" -j REJECT --reject-with tcp-reset
     done
 }
 
 setup_secure_dns() {
     local vpn_dns_list="$1"
-    # $2 (vpn_ips) is unused in new ipset-based implementation
+    local vpn_ips="$2"
     local wg_interface="$3"
-    # $4 (vpn_ip6_subnets) is unused in new ipset-based implementation
+    local vpn_ip6_subnets="${4:-}"
 
     [ -z "$vpn_dns_list" ] && return 0
 
@@ -979,50 +975,46 @@ setup_secure_dns() {
     local input_block_chain="vpn_dns_block_${wg_interface}"
     local input_block_chain_v6="vpn_dns_block6_${wg_interface}"
 
-    # Reconstruct IPSET names based on interface
-    local ipset_v4="vpn_${wg_interface}"
-    local ipset_v6="vpn6_${wg_interface}"
-
-    logger -t wireguard "[$wg_interface] Setting up complete DNS hijacking (IPv4+IPv6) via ipset"
+    logger -t wireguard "[$wg_interface] Setting up complete DNS hijacking (IPv4+IPv6)"
 
     # Initialize INPUT block chains (Prevent direct access to Router DNS)
-    iptables -N $input_block_chain 2>/dev/null || iptables -F $input_block_chain
-    iptables -C INPUT -j $input_block_chain 2>/dev/null || iptables -I INPUT 1 -j $input_block_chain
+    iptables -w -N $input_block_chain 2>/dev/null || iptables -w -F $input_block_chain
+    iptables -w -C INPUT -j $input_block_chain 2>/dev/null || iptables -w -I INPUT 1 -j $input_block_chain
     
     if [ "$IPV6_SUPPORTED" = "1" ]; then
-        ip6tables -N $input_block_chain_v6 2>/dev/null || ip6tables -F $input_block_chain_v6
-        ip6tables -C INPUT -j $input_block_chain_v6 2>/dev/null || ip6tables -I INPUT 1 -j $input_block_chain_v6
+        ip6tables -w -N $input_block_chain_v6 2>/dev/null || ip6tables -w -F $input_block_chain_v6
+        ip6tables -w -C INPUT -j $input_block_chain_v6 2>/dev/null || ip6tables -w -I INPUT 1 -j $input_block_chain_v6
     fi
 
     # Cleanup old rules (IPv4)
-    iptables -t nat -D PREROUTING -j $nat_chain 2>/dev/null
-    iptables -t nat -F $nat_chain 2>/dev/null
-    iptables -t nat -X $nat_chain 2>/dev/null
-    iptables -D FORWARD -j $filter_chain 2>/dev/null
-    iptables -F $filter_chain 2>/dev/null
-    iptables -X $filter_chain 2>/dev/null
+    iptables -w -t nat -D PREROUTING -j $nat_chain 2>/dev/null
+    iptables -w -t nat -F $nat_chain 2>/dev/null
+    iptables -w -t nat -X $nat_chain 2>/dev/null
+    iptables -w -D FORWARD -j $filter_chain 2>/dev/null
+    iptables -w -F $filter_chain 2>/dev/null
+    iptables -w -X $filter_chain 2>/dev/null
 
     # Cleanup old rules (IPv6)
-    ip6tables -t nat -D PREROUTING -j $nat_chain_v6 2>/dev/null
-    ip6tables -t nat -F $nat_chain_v6 2>/dev/null
-    ip6tables -t nat -X $nat_chain_v6 2>/dev/null
-    ip6tables -D FORWARD -j $filter_chain_v6 2>/dev/null
-    ip6tables -F $filter_chain_v6 2>/dev/null
-    ip6tables -X $filter_chain_v6 2>/dev/null
+    ip6tables -w -t nat -D PREROUTING -j $nat_chain_v6 2>/dev/null
+    ip6tables -w -t nat -F $nat_chain_v6 2>/dev/null
+    ip6tables -w -t nat -X $nat_chain_v6 2>/dev/null
+    ip6tables -w -D FORWARD -j $filter_chain_v6 2>/dev/null
+    ip6tables -w -F $filter_chain_v6 2>/dev/null
+    ip6tables -w -X $filter_chain_v6 2>/dev/null
 
     # Create new chains with error handling
-    if ! iptables -t nat -N $nat_chain 2>/dev/null; then
+    if ! iptables -w -t nat -N $nat_chain 2>/dev/null; then
         logger -t wireguard "[$wg_interface] Warning: Could not create IPv4 NAT chain (may exist)"
     fi
-    if ! iptables -N $filter_chain 2>/dev/null; then
+    if ! iptables -w -N $filter_chain 2>/dev/null; then
         logger -t wireguard "[$wg_interface] Warning: Could not create IPv4 filter chain (may exist)"
     fi
 
     if [ "$IPV6_SUPPORTED" = "1" ]; then
-        if ! ip6tables -t nat -N $nat_chain_v6 2>/dev/null; then
+        if ! ip6tables -w -t nat -N $nat_chain_v6 2>/dev/null; then
             logger -t wireguard "[$wg_interface] Warning: Could not create IPv6 NAT chain (may exist)"
         fi
-        if ! ip6tables -N $filter_chain_v6 2>/dev/null; then
+        if ! ip6tables -w -N $filter_chain_v6 2>/dev/null; then
             logger -t wireguard "[$wg_interface] Warning: Could not create IPv6 filter chain (may exist)"
         fi
     fi
@@ -1038,70 +1030,92 @@ setup_secure_dns() {
     vpn_dns_v4=$(echo "$vpn_dns_v4" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     vpn_dns_v6=$(echo "$vpn_dns_v6" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
-    # IPv4 DNS DNAT + Filtering (Using IPSet)
+    # IPv4 DNS DNAT + Filtering
     if [ -n "$vpn_dns_v4" ]; then
-        # DNAT DNS queries to VPN DNS (IPv4) - matching ipset
+        # Filter VPN_IPS for IPv4 only
+        for target in $vpn_ips; do
+            actual_ip=$(get_ip_from_target "$target")
+            if ! echo "$actual_ip" | grep -q ":"; then
+                vpn_ips_v4="$vpn_ips_v4 $actual_ip"
+            fi
+        done
+
+        for item in $vpn_ips_v4; do
+            # DNAT DNS queries to VPN DNS (IPv4)
         if [ "$(echo $vpn_dns_v4 | wc -w)" -eq 1 ]; then
-            iptables -t nat -A $nat_chain -m set --match-set $ipset_v4 src -p udp --dport 53 -j DNAT --to-destination $vpn_dns_v4
-            iptables -t nat -A $nat_chain -m set --match-set $ipset_v4 src -p tcp --dport 53 -j DNAT --to-destination $vpn_dns_v4
+                iptables -w -t nat -A $nat_chain -s $item -p udp --dport 53 -j DNAT --to-destination $vpn_dns_v4
+                iptables -w -t nat -A $nat_chain -s $item -p tcp --dport 53 -j DNAT --to-destination $vpn_dns_v4
         else
             local i=0 dns_count=$(echo $vpn_dns_v4 | wc -w)
             for dns in $vpn_dns_v4; do
-                iptables -t nat -A $nat_chain -m set --match-set $ipset_v4 src -p udp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination $dns
-                iptables -t nat -A $nat_chain -m set --match-set $ipset_v4 src -p tcp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination $dns
+                    iptables -w -t nat -A $nat_chain -s $item -p udp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination $dns
+                    iptables -w -t nat -A $nat_chain -s $item -p tcp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination $dns
                 i=$((i + 1))
             done
         fi
 
-        # Block DoT/DoH (IPv4) - matching ipset
-        iptables -A $filter_chain -m set --match-set $ipset_v4 src -p tcp --dport 853 -j REJECT --reject-with tcp-reset
-        iptables -A $filter_chain -m set --match-set $ipset_v4 src -p udp --dport 853 -j REJECT --reject-with icmp-port-unreachable
+            # Block DoT/DoH (IPv4)
+            iptables -w -A $filter_chain -s $item -p tcp --dport 853 -j REJECT --reject-with tcp-reset
+            iptables -w -A $filter_chain -s $item -p udp --dport 853 -j REJECT --reject-with icmp-port-unreachable
 
         # Dynamically block DoH providers by reading the https-dns-proxy config
-        block_doh_domains iptables $filter_chain "-m set --match-set $ipset_v4 src"
+            block_doh_domains iptables $filter_chain "-s $item"
 
-        # Block access to local dnsmasq (INPUT) - matching ipset
-        iptables -A $input_block_chain -m set --match-set $ipset_v4 src -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable
-        iptables -A $input_block_chain -m set --match-set $ipset_v4 src -p tcp --dport 53 -j REJECT --reject-with tcp-reset
-
-        iptables -t nat -I PREROUTING 1 -j $nat_chain 2>/dev/null || \
+            # Block access to local dnsmasq (INPUT)
+            iptables -w -A $input_block_chain -s $item -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable
+            iptables -w -A $input_block_chain -s $item -p tcp --dport 53 -j REJECT --reject-with tcp-reset
+        done
+        iptables -w -t nat -I PREROUTING 1 -j $nat_chain 2>/dev/null || \
             logger -t wireguard "[$wg_interface] Warning: Could not insert IPv4 NAT chain"
-        iptables -I FORWARD 1 -j $filter_chain 2>/dev/null || \
+        iptables -w -I FORWARD 1 -j $filter_chain 2>/dev/null || \
             logger -t wireguard "[$wg_interface] Warning: Could not insert IPv4 filter chain"
     fi
 
-    # IPv6 DNS DNAT + Filtering (Using IPSet)
+    # IPv6 DNS DNAT + Filtering
     if [ -n "$vpn_dns_v6" ] && [ "$IPV6_SUPPORTED" = "1" ]; then
-        # DNAT DNS queries to VPN DNS (IPv6) - matching ipset
+        # Filter VPN_IPS for IPv6 only and add routable subnets
+        local vpn_ips_v6=""
+        for target in $vpn_ips; do
+            actual_ip=$(get_ip_from_target "$target")
+            if echo "$actual_ip" | grep -q ":"; then
+                vpn_ips_v6="$vpn_ips_v6 $actual_ip"
+            fi
+        done
+        # Append routable subnets
+        if [ -n "$vpn_ip6_subnets" ]; then
+            vpn_ips_v6="$vpn_ips_v6 $vpn_ip6_subnets"
+        fi
+
+        for item in $vpn_ips_v6; do
+            # DNAT DNS queries to VPN DNS (IPv6)
         if [ "$(echo $vpn_dns_v6 | wc -w)" -eq 1 ]; then
-            ip6tables -t nat -A $nat_chain_v6 -m set --match-set $ipset_v6 src -p udp --dport 53 -j DNAT --to-destination $vpn_dns_v6
-            ip6tables -t nat -A $nat_chain_v6 -m set --match-set $ipset_v6 src -p tcp --dport 53 -j DNAT --to-destination $vpn_dns_v6
+                ip6tables -w -t nat -A $nat_chain_v6 -s $item -p udp --dport 53 -j DNAT --to-destination $vpn_dns_v6
+                ip6tables -w -t nat -A $nat_chain_v6 -s $item -p tcp --dport 53 -j DNAT --to-destination $vpn_dns_v6
         else
             local i=0 dns_count=$(echo $vpn_dns_v6 | wc -w)
             for dns in $vpn_dns_v6; do
-                ip6tables -t nat -A $nat_chain_v6 -m set --match-set $ipset_v6 src -p udp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination "[$dns]"
-                ip6tables -t nat -A $nat_chain_v6 -m set --match-set $ipset_v6 src -p tcp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination "[$dns]"
+                    ip6tables -w -t nat -A $nat_chain_v6 -s $item -p udp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination "[$dns]"
+                    ip6tables -w -t nat -A $nat_chain_v6 -s $item -p tcp --dport 53 -m statistic --mode nth --every $((dns_count - i)) --packet 0 -j DNAT --to-destination "[$dns]"
                 i=$((i + 1))
             done
         fi
 
-        # Block access to local dnsmasq (INPUT) - matching ipset
-        ip6tables -A $input_block_chain_v6 -m set --match-set $ipset_v6 src -p udp --dport 53 -j REJECT --reject-with icmp6-port-unreachable
-        ip6tables -A $input_block_chain_v6 -m set --match-set $ipset_v6 src -p tcp --dport 53 -j REJECT --reject-with tcp-reset
+            # Block access to local dnsmasq (INPUT)
+            ip6tables -w -A $input_block_chain_v6 -s $item -p udp --dport 53 -j REJECT --reject-with icmp6-port-unreachable
+            ip6tables -w -A $input_block_chain_v6 -s $item -p tcp --dport 53 -j REJECT --reject-with tcp-reset
+        done
 
-        # Block DoT/DoH (IPv6) - apply broadly (or scoped to ipset if desired, broadly matches existing logic)
-        # Existing logic was broad (no src match), but we should scope it if we want consistency.
-        # However, keeping it broad for now as per previous implementation logic.
-        ip6tables -A $filter_chain_v6 -p tcp --dport 853 -j REJECT --reject-with tcp-reset
-        ip6tables -A $filter_chain_v6 -p udp --dport 853 -j REJECT --reject-with icmp6-port-unreachable
+        # Block DoT/DoH (IPv6) - apply broadly
+        ip6tables -w -A $filter_chain_v6 -p tcp --dport 853 -j REJECT --reject-with tcp-reset
+        ip6tables -w -A $filter_chain_v6 -p udp --dport 853 -j REJECT --reject-with icmp6-port-unreachable
         # Dynamically block DoH providers by reading the https-dns-proxy config
         block_doh_domains ip6tables $filter_chain_v6
 
-        ip6tables -t nat -I PREROUTING 1 -j $nat_chain_v6
-        ip6tables -I FORWARD 1 -j $filter_chain_v6
+        ip6tables -w -t nat -I PREROUTING 1 -j $nat_chain_v6
+        ip6tables -w -I FORWARD 1 -j $filter_chain_v6
     fi
 
-    logger -t wireguard "[$wg_interface] Complete DNS hijacking configured (IPv4+IPv6) via ipset"
+    logger -t wireguard "[$wg_interface] Complete DNS hijacking configured (IPv4+IPv6)"
 }
 
 apply_ipv6_rules() {
@@ -1468,27 +1482,29 @@ if [ "$VPN_IPS" != "none" ]; then
 fi
 
 # CRITICAL: Block WAN DNS responses to VPN clients (IPv4) - applied EARLY
+# CRITICAL: Block WAN DNS responses to VPN clients (IPv4) - applied EARLY
 logger -t wireguard "[$WG_INTERFACE] Blocking WAN DNS responses to VPN clients (IPv4)"
-iptables -t mangle -D OUTPUT -p udp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
-iptables -t mangle -D OUTPUT -p tcp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
-iptables -t mangle -I OUTPUT 1 -p udp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP
-iptables -t mangle -I OUTPUT 1 -p tcp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP
+iptables -w -t mangle -D OUTPUT -p udp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
+iptables -w -t mangle -D OUTPUT -p tcp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
+iptables -w -t mangle -I OUTPUT 1 -p udp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP
+iptables -w -t mangle -I OUTPUT 1 -p tcp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP
 
 # CRITICAL: Block WAN DNS responses to VPN clients (IPv6) - applied EARLY
 if [ "$IPV6_SUPPORTED" = "1" ]; then
     logger -t wireguard "[$WG_INTERFACE] Blocking WAN DNS responses to VPN clients (IPv6)"
-    ip6tables -t mangle -D OUTPUT -p udp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
-    ip6tables -t mangle -D OUTPUT -p tcp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
-    ip6tables -t mangle -I OUTPUT 1 -p udp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP
-    ip6tables -t mangle -I OUTPUT 1 -p tcp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP
+    ip6tables -w -t mangle -D OUTPUT -p udp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
+    ip6tables -w -t mangle -D OUTPUT -p tcp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
+    ip6tables -w -t mangle -I OUTPUT 1 -p udp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP
+    ip6tables -w -t mangle -I OUTPUT 1 -p tcp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP
 fi
 
 # Setup fwmark for DNS routing (IPv4)
+# Setup fwmark for DNS routing (IPv4)
 logger -t wireguard "[$WG_INTERFACE] Setting up DNS fwmark $MARK_VALUE (IPv4)."
-iptables -t mangle -N $MARK_CHAIN 2>/dev/null
-iptables -t mangle -F $MARK_CHAIN
-iptables -t mangle -A $MARK_CHAIN -p udp --dport 53 -m set --match-set $IPSET_NAME src -j MARK --set-mark $MARK_VALUE
-iptables -t mangle -A $MARK_CHAIN -p tcp --dport 53 -m set --match-set $IPSET_NAME src -j MARK --set-mark $MARK_VALUE
+iptables -w -t mangle -N $MARK_CHAIN 2>/dev/null
+iptables -w -t mangle -F $MARK_CHAIN
+iptables -w -t mangle -A $MARK_CHAIN -p udp --dport 53 -m set --match-set $IPSET_NAME src -j MARK --set-mark $MARK_VALUE
+iptables -w -t mangle -A $MARK_CHAIN -p tcp --dport 53 -m set --match-set $IPSET_NAME src -j MARK --set-mark $MARK_VALUE
 
 # NOTE: We intentionally do NOT add OUTPUT marking for target-IP interfaces.
 # Target-IP routing is based on source IP (client traffic), not router-originated traffic.
@@ -1497,30 +1513,31 @@ iptables -t mangle -A $MARK_CHAIN -p tcp --dport 53 -m set --match-set $IPSET_NA
 
 lan_ifaces=$(get_lan_ifaces)
 for lan_if in $lan_ifaces; do
-    iptables -t mangle -C PREROUTING -i $lan_if -j $MARK_CHAIN 2>/dev/null || iptables -t mangle -A PREROUTING -i $lan_if -j $MARK_CHAIN
+    iptables -w -t mangle -C PREROUTING -i $lan_if -j $MARK_CHAIN 2>/dev/null || iptables -w -t mangle -A PREROUTING -i $lan_if -j $MARK_CHAIN
 done
 
 # Setup fwmark for DNS routing (IPv6)
 if [ "$IPV6_SUPPORTED" = "1" ]; then
     logger -t wireguard "[$WG_INTERFACE] Setting up DNS fwmark $MARK_VALUE (IPv6)."
-    ip6tables -t mangle -N $MARK_CHAIN 2>/dev/null
-    ip6tables -t mangle -F $MARK_CHAIN
-    ip6tables -t mangle -A $MARK_CHAIN -p udp --dport 53 -m set --match-set $IPSET_NAME_V6 src -j MARK --set-mark $MARK_VALUE
-    ip6tables -t mangle -A $MARK_CHAIN -p tcp --dport 53 -m set --match-set $IPSET_NAME_V6 src -j MARK --set-mark $MARK_VALUE
+    ip6tables -w -t mangle -N $MARK_CHAIN 2>/dev/null
+    ip6tables -w -t mangle -F $MARK_CHAIN
+    ip6tables -w -t mangle -A $MARK_CHAIN -p udp --dport 53 -m set --match-set $IPSET_NAME_V6 src -j MARK --set-mark $MARK_VALUE
+    ip6tables -w -t mangle -A $MARK_CHAIN -p tcp --dport 53 -m set --match-set $IPSET_NAME_V6 src -j MARK --set-mark $MARK_VALUE
 
     # NOTE: No OUTPUT marking for IPv6 either - same reason as IPv4
 
     for lan_if in $lan_ifaces; do
-        ip6tables -t mangle -C PREROUTING -i $lan_if -j $MARK_CHAIN 2>/dev/null || ip6tables -t mangle -A PREROUTING -i $lan_if -j $MARK_CHAIN
+        ip6tables -w -t mangle -C PREROUTING -i $lan_if -j $MARK_CHAIN 2>/dev/null || ip6tables -w -t mangle -A PREROUTING -i $lan_if -j $MARK_CHAIN
     done
 
 fi
 
-ip rule del fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE 2>/dev/null
-ip rule add fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE priority $((ROUTING_TABLE - 5))
+ip rule del fwmark $MARK_VALUE table $ROUTING_TABLE 2>/dev/null
+ip rule add fwmark $MARK_VALUE table $ROUTING_TABLE priority $((ROUTING_TABLE - 5))
+
 if [ "$IPV6_SUPPORTED" = "1" ]; then
-    ip -6 rule del fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE 2>/dev/null
-    ip -6 rule add fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE priority $((ROUTING_TABLE - 5))
+    ip -6 rule del fwmark $MARK_VALUE table $ROUTING_TABLE 2>/dev/null
+    ip -6 rule add fwmark $MARK_VALUE table $ROUTING_TABLE priority $((ROUTING_TABLE - 5))
 fi
 
 # Discover and configure existing clients
@@ -1596,22 +1613,22 @@ if [ -f "$WG_DB_PATH" ] && [ "$IPV6_SUPPORTED" = "1" ]; then
 
                 
                 # Re-add fwmark marking rule if not present
-                if ! ip6tables -t mangle -C $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE 2>/dev/null; then
-                    ip6tables -t mangle -A $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE
+                if ! ip6tables -w -t mangle -C $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE 2>/dev/null; then
+                    ip6tables -w -t mangle -A $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE
                 fi
                 
                 # Re-add block rules for leak prevention
                 lan_ifaces=$(get_lan_ifaces)
                 for lan_if in $lan_ifaces; do
-                    ip6tables -D $BLOCK_CHAIN -i $lan_if -m mac --mac-source $mac -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
-                    ip6tables -I $BLOCK_CHAIN 1 -i $lan_if -m mac --mac-source $mac -m mark ! --mark $MARK_VALUE -j DROP
+                    ip6tables -w -D $BLOCK_CHAIN -i $lan_if -m mac --mac-source $mac -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
+                    ip6tables -w -I $BLOCK_CHAIN 1 -i $lan_if -m mac --mac-source $mac -m mark ! --mark $MARK_VALUE -j DROP
                 done
                 
                 # Re-add IPv6 DNS blocking
-                ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p udp --dport 53 -j REJECT 2>/dev/null
-                ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT 2>/dev/null
-                ip6tables -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p udp --dport 53 -j REJECT
-                ip6tables -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT
+                ip6tables -w -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p udp --dport 53 -j REJECT 2>/dev/null
+                ip6tables -w -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT 2>/dev/null
+                ip6tables -w -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p udp --dport 53 -j REJECT
+                ip6tables -w -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT
             fi
         fi
     done
@@ -1637,7 +1654,7 @@ logger -t wireguard "[$WG_INTERFACE] Updated interface start_time in SQLite."
 
 # Add a final dnsmasq reload to ensure it binds to the ipset
 logger -t wireguard "[$WG_INTERFACE] Performing guaranteed dnsmasq reload."
-/etc/init.d/dnsmasq restart >/dev/null 2>&1
+( /etc/init.d/dnsmasq reload >/dev/null 2>&1 ) &
 
 EOF_IFACE_ROUTING
 
@@ -1698,6 +1715,7 @@ BLOCK_IPV6_DNS_INPUT_CHAIN="${WG_INTERFACE}_v6_dns_in"
 COMMON_LIB_PLACEHOLDER
 
 # Cleanup function for DNS rules
+# Cleanup function for DNS rules
 cleanup_vpn_dns() {
     local wg_interface="$1"
     local nat_chain="vpn_dns_nat_${wg_interface}"
@@ -1708,26 +1726,26 @@ cleanup_vpn_dns() {
     local input_block_chain_v6="vpn_dns_block6_${wg_interface}"
 
     # Clean up IPv4
-    iptables -t nat -D PREROUTING -j $nat_chain 2>/dev/null
-    iptables -t nat -F $nat_chain 2>/dev/null
-    iptables -t nat -X $nat_chain 2>/dev/null
-    iptables -D FORWARD -j $filter_chain 2>/dev/null
-    iptables -F $filter_chain 2>/dev/null
-    iptables -X $filter_chain 2>/dev/null
-    iptables -D INPUT -j $input_block_chain 2>/dev/null
-    iptables -F $input_block_chain 2>/dev/null
-    iptables -X $input_block_chain 2>/dev/null
+    iptables -w -t nat -D PREROUTING -j $nat_chain 2>/dev/null
+    iptables -w -t nat -F $nat_chain 2>/dev/null
+    iptables -w -t nat -X $nat_chain 2>/dev/null
+    iptables -w -D FORWARD -j $filter_chain 2>/dev/null
+    iptables -w -F $filter_chain 2>/dev/null
+    iptables -w -X $filter_chain 2>/dev/null
+    iptables -w -D INPUT -j $input_block_chain 2>/dev/null
+    iptables -w -F $input_block_chain 2>/dev/null
+    iptables -w -X $input_block_chain 2>/dev/null
 
     # Clean up IPv6
-    ip6tables -t nat -D PREROUTING -j $nat_chain_v6 2>/dev/null
-    ip6tables -t nat -F $nat_chain_v6 2>/dev/null
-    ip6tables -t nat -X $nat_chain_v6 2>/dev/null
-    ip6tables -D FORWARD -j $filter_chain_v6 2>/dev/null
-    ip6tables -F $filter_chain_v6 2>/dev/null
-    ip6tables -X $filter_chain_v6 2>/dev/null
-    ip6tables -D INPUT -j $input_block_chain_v6 2>/dev/null
-    ip6tables -F $input_block_chain_v6 2>/dev/null
-    ip6tables -X $input_block_chain_v6 2>/dev/null
+    ip6tables -w -t nat -D PREROUTING -j $nat_chain_v6 2>/dev/null
+    ip6tables -w -t nat -F $nat_chain_v6 2>/dev/null
+    ip6tables -w -t nat -X $nat_chain_v6 2>/dev/null
+    ip6tables -w -D FORWARD -j $filter_chain_v6 2>/dev/null
+    ip6tables -w -F $filter_chain_v6 2>/dev/null
+    ip6tables -w -X $filter_chain_v6 2>/dev/null
+    ip6tables -w -D INPUT -j $input_block_chain_v6 2>/dev/null
+    ip6tables -w -F $input_block_chain_v6 2>/dev/null
+    ip6tables -w -X $input_block_chain_v6 2>/dev/null
 
     logger -t wireguard "[$wg_interface] Complete DNS rules cleaned up (IPv4+IPv6)"
 }
@@ -1737,32 +1755,32 @@ NAT66_CHAIN="nat66_${WG_INTERFACE}"
 IPV6_MARK_CHAIN="mark_ipv6_${WG_INTERFACE}"
 
 # Clean up NAT66 MASQUERADE chain
-ip6tables -t nat -D POSTROUTING -j $NAT66_CHAIN 2>/dev/null
-ip6tables -t nat -F $NAT66_CHAIN 2>/dev/null
-ip6tables -t nat -X $NAT66_CHAIN 2>/dev/null
+ip6tables -w -t nat -D POSTROUTING -j $NAT66_CHAIN 2>/dev/null
+ip6tables -w -t nat -F $NAT66_CHAIN 2>/dev/null
+ip6tables -w -t nat -X $NAT66_CHAIN 2>/dev/null
 
 # Clean up IPv6 fwmark marking chain
 lan_ifaces=$(get_lan_ifaces)
 for lan_if in $lan_ifaces; do
-    ip6tables -t mangle -D PREROUTING -i $lan_if -j $IPV6_MARK_CHAIN 2>/dev/null
+    ip6tables -w -t mangle -D PREROUTING -i $lan_if -j $IPV6_MARK_CHAIN 2>/dev/null
 done
-ip6tables -t mangle -F $IPV6_MARK_CHAIN 2>/dev/null
-ip6tables -t mangle -X $IPV6_MARK_CHAIN 2>/dev/null
+ip6tables -w -t mangle -F $IPV6_MARK_CHAIN 2>/dev/null
+ip6tables -w -t mangle -X $IPV6_MARK_CHAIN 2>/dev/null
 
 logger -t wireguard "[$WG_INTERFACE] NAT66 and IPv6 fwmark chains cleaned up"
 
 # Clean up ALL potential IPv6 blocking chains
-ip6tables -F $BLOCK_CHAIN 2>/dev/null
-ip6tables -D FORWARD -j $BLOCK_CHAIN 2>/dev/null
-ip6tables -X $BLOCK_CHAIN 2>/dev/null
-ip6tables -F $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null
-ip6tables -D FORWARD -j $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null
-ip6tables -X $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null
+ip6tables -w -F $BLOCK_CHAIN 2>/dev/null
+ip6tables -w -D FORWARD -j $BLOCK_CHAIN 2>/dev/null
+ip6tables -w -X $BLOCK_CHAIN 2>/dev/null
+ip6tables -w -F $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null
+ip6tables -w -D FORWARD -j $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null
+ip6tables -w -X $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null
 
 # Clean up policy routing rules
-ip6tables -F $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null
-ip6tables -D INPUT -j $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null
-ip6tables -X $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null
+ip6tables -w -F $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null
+ip6tables -w -D INPUT -j $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null
+ip6tables -w -X $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null
 while ip rule | grep -q "lookup $ROUTING_TABLE"; do
     ip rule del $(ip rule | grep "lookup $ROUTING_TABLE" | head -n1)
 done
@@ -1774,53 +1792,55 @@ done
 logger -t wireguard "[$WG_INTERFACE] Cleaning up DNS leak-prevention firewall mark $MARK_VALUE."
 ip rule del fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE 2>/dev/null
 ip -6 rule del fwmark $MARK_VALUE/$MARK_VALUE table $ROUTING_TABLE 2>/dev/null
+ip rule del fwmark $MARK_VALUE table $ROUTING_TABLE 2>/dev/null
+ip -6 rule del fwmark $MARK_VALUE table $ROUTING_TABLE 2>/dev/null
 
 lan_ifaces=$(get_lan_ifaces)
 for lan_if in $lan_ifaces; do
-    iptables -t mangle -D PREROUTING -i $lan_if -j $MARK_CHAIN 2>/dev/null
-    ip6tables -t mangle -D PREROUTING -i $lan_if -j $MARK_CHAIN 2>/dev/null
+    iptables -w -t mangle -D PREROUTING -i $lan_if -j $MARK_CHAIN 2>/dev/null
+    ip6tables -w -t mangle -D PREROUTING -i $lan_if -j $MARK_CHAIN 2>/dev/null
 done
-iptables -t mangle -F $MARK_CHAIN 2>/dev/null
-iptables -t mangle -X $MARK_CHAIN 2>/dev/null
-ip6tables -t mangle -F $MARK_CHAIN 2>/dev/null
-ip6tables -t mangle -X $MARK_CHAIN 2>/dev/null
+iptables -w -t mangle -F $MARK_CHAIN 2>/dev/null
+iptables -w -t mangle -X $MARK_CHAIN 2>/dev/null
+ip6tables -w -t mangle -F $MARK_CHAIN 2>/dev/null
+ip6tables -w -t mangle -X $MARK_CHAIN 2>/dev/null
 
 # Clean up specific CONNMARK restore rules
 
 # Clean up outgoing DNS marking rules
 for dns in $VPN_DNS; do
     if ! echo "$dns" | grep -q ":"; then
-        iptables -t mangle -D OUTPUT -d $dns -p udp --dport 53 -j MARK --set-mark $MARK_VALUE 2>/dev/null
-        iptables -t mangle -D OUTPUT -d $dns -p tcp --dport 53 -j MARK --set-mark $MARK_VALUE 2>/dev/null
+        iptables -w -t mangle -D OUTPUT -d $dns -p udp --dport 53 -j MARK --set-mark $MARK_VALUE 2>/dev/null
+        iptables -w -t mangle -D OUTPUT -d $dns -p tcp --dport 53 -j MARK --set-mark $MARK_VALUE 2>/dev/null
     else
-        ip6tables -t mangle -D OUTPUT -d $dns -p udp --dport 53 -j MARK --set-mark $MARK_VALUE 2>/dev/null
-        ip6tables -t mangle -D OUTPUT -d $dns -p tcp --dport 53 -j MARK --set-mark $MARK_VALUE 2>/dev/null
+        ip6tables -w -t mangle -D OUTPUT -d $dns -p udp --dport 53 -j MARK --set-mark $MARK_VALUE 2>/dev/null
+        ip6tables -w -t mangle -D OUTPUT -d $dns -p tcp --dport 53 -j MARK --set-mark $MARK_VALUE 2>/dev/null
     fi
 done
 
 # Clean up WAN DNS blocking rules (IPv4+IPv6)
-iptables -t mangle -D OUTPUT -p udp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
-iptables -t mangle -D OUTPUT -p tcp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
-ip6tables -t mangle -D OUTPUT -p udp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
-ip6tables -t mangle -D OUTPUT -p tcp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
+iptables -w -t mangle -D OUTPUT -p udp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
+iptables -w -t mangle -D OUTPUT -p tcp --sport 53 -m set --match-set $IPSET_NAME dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
+ip6tables -w -t mangle -D OUTPUT -p udp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
+ip6tables -w -t mangle -D OUTPUT -p tcp --sport 53 -m set --match-set $IPSET_NAME_V6 dst -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
 
 # Activate Kill Switch
 logger -t wireguard "[$WG_INTERFACE] Interface is down. Activating kill switch."
-iptables -N $KS_CHAIN 2>/dev/null; ip6tables -N $KS_CHAIN 2>/dev/null
-iptables -C FORWARD -j $KS_CHAIN 2>/dev/null || iptables -I FORWARD 1 -j $KS_CHAIN
-ip6tables -C FORWARD -j $KS_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $KS_CHAIN
+iptables -w -N $KS_CHAIN 2>/dev/null; ip6tables -w -N $KS_CHAIN 2>/dev/null
+iptables -w -C FORWARD -j $KS_CHAIN 2>/dev/null || iptables -w -I FORWARD 1 -j $KS_CHAIN
+ip6tables -w -C FORWARD -j $KS_CHAIN 2>/dev/null || ip6tables -w -I FORWARD 1 -j $KS_CHAIN
 
 if [ "$VPN_IPS" != "none" ]; then
 for target in $VPN_IPS; do
     actual_ip=$(get_ip_from_target "$target")
 
-    iptables -A $KS_CHAIN -s $actual_ip -j REJECT --reject-with icmp-host-prohibited
+    iptables -w -A $KS_CHAIN -s $actual_ip -j REJECT --reject-with icmp-host-prohibited
     case "$actual_ip" in
         */*) # For subnets, find all known MACs and block them for IPv6
             if [ -f /cfg/dhcp.leases ]; then
                 while read -r exp mac ip host; do
                     if is_in_subnet "$ip" "$actual_ip"; then
-                        ip6tables -A $KS_CHAIN -m mac --mac-source $mac -j REJECT --reject-with icmp6-adm-prohibited
+                        ip6tables -w -A $KS_CHAIN -m mac --mac-source $mac -j REJECT --reject-with icmp6-adm-prohibited
                     fi
                 done < /cfg/dhcp.leases
             fi
@@ -1828,7 +1848,7 @@ for target in $VPN_IPS; do
         *) # For individual IPs, get MAC directly
             mac=$(ip neigh show "$actual_ip" | grep -o '[0-9a-f:]\{17\}' | head -1)
             if [ -n "$mac" ] && [ "$mac" != "<incomplete>" ]; then
-                ip6tables -A $KS_CHAIN -m mac --mac-source $mac -j REJECT --reject-with icmp6-adm-prohibited
+                ip6tables -w -A $KS_CHAIN -m mac --mac-source $mac -j REJECT --reject-with icmp6-adm-prohibited
             fi
             ;;
     esac
@@ -1852,7 +1872,7 @@ ipset destroy $IPSET_NAME 2>/dev/null
 ipset destroy $IPSET_NAME_V6 2>/dev/null
 
 # Reload dnsmasq to apply changes (remove config)
-/etc/init.d/dnsmasq restart >/dev/null 2>&1
+( /etc/init.d/dnsmasq reload >/dev/null 2>&1 ) &
 
 # Clean up IPv6 prefix state files
 WG_TMP_DIR="/tmp/wg-custom"

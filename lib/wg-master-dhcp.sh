@@ -105,13 +105,13 @@ get_dhcp_lease_file() {
 cleanup_iptables_chain() {
     local table="$1" parent="$2" chain="$3"
     if [ "$table" = "filter" ]; then
-        iptables -D "$parent" -j "$chain" 2>/dev/null
-        iptables -F "$chain" 2>/dev/null
-        iptables -X "$chain" 2>/dev/null
+        iptables -w -D "$parent" -j "$chain" 2>/dev/null
+        iptables -w -F "$chain" 2>/dev/null
+        iptables -w -X "$chain" 2>/dev/null
     else
-        iptables -t "$table" -D "$parent" -j "$chain" 2>/dev/null
-        iptables -t "$table" -F "$chain" 2>/dev/null
-        iptables -t "$table" -X "$chain" 2>/dev/null
+        iptables -w -t "$table" -D "$parent" -j "$chain" 2>/dev/null
+        iptables -w -t "$table" -F "$chain" 2>/dev/null
+        iptables -w -t "$table" -X "$chain" 2>/dev/null
     fi
 }
 
@@ -121,13 +121,13 @@ cleanup_iptables_chain() {
 cleanup_ip6tables_chain() {
     local table="$1" parent="$2" chain="$3"
     if [ "$table" = "filter" ]; then
-        ip6tables -D "$parent" -j "$chain" 2>/dev/null
-        ip6tables -F "$chain" 2>/dev/null
-        ip6tables -X "$chain" 2>/dev/null
+        ip6tables -w -D "$parent" -j "$chain" 2>/dev/null
+        ip6tables -w -F "$chain" 2>/dev/null
+        ip6tables -w -X "$chain" 2>/dev/null
     else
-        ip6tables -t "$table" -D "$parent" -j "$chain" 2>/dev/null
-        ip6tables -t "$table" -F "$chain" 2>/dev/null
-        ip6tables -t "$table" -X "$chain" 2>/dev/null
+        ip6tables -w -t "$table" -D "$parent" -j "$chain" 2>/dev/null
+        ip6tables -w -t "$table" -F "$chain" 2>/dev/null
+        ip6tables -w -t "$table" -X "$chain" 2>/dev/null
     fi
 }
 
@@ -219,64 +219,56 @@ cleanup_interface_rules() {
 
 # === CLEANUP FUNCTION FOR A SPECIFIC INTERFACE ===
 cleanup_client_from_interface() {
-    local iface="$1"
-    local mac="$2"
-    local rt_table="$3"
-    local ipv6_sup="$4"
-    local mark_chain_v6="mark_ipv6_${iface}"
-    local block_chain="${iface}_ipv6_block"
-    local input_block_chain="${iface}_v6_dns_in"
-    local ipv4_block_chain="${iface}_ipv4_only_block"
-    local ipset_name="vpn_${iface}"
-    local ipset_name_v6="vpn6_${iface}"
-
-    # Get old IP
+    local iface="$1" mac="$2" rt="$3" ipv6_sup="$4"
+    local MARK_VALUE="$((0x10000 + rt))"
+    local IPV6_MARK_CHAIN="mark_ipv6_${iface}"
+    local BLOCK_CHAIN="${iface}_ipv6_block"
+    local BLOCK_IPV4_ONLY_CHAIN="${iface}_ipv4_only_block"
+    local BLOCK_IPV6_DNS_INPUT_CHAIN="${iface}_v6_dns_in"
+    
+    # Remove IPv4 routing rule using state file
     local OLD_IP_FILE="${WG_TMP_DIR}/ip_${iface}_${mac//:/}"
-    local old_ip=""
     if [ -f "$OLD_IP_FILE" ]; then
-        old_ip=$(cat "$OLD_IP_FILE")
+        local OLD_IP=$(cat "$OLD_IP_FILE")
+        ip rule del from "$OLD_IP" table $rt 2>/dev/null
         rm -f "$OLD_IP_FILE"
+        logger -t wg-dhcp-master "[$iface] Removed IPv4 rule for $OLD_IP"
     fi
-
-    if [ -n "$old_ip" ]; then
-        logger -t wg-dhcp-cleanup "[$iface] Removing $old_ip ($mac) from routing and ipset"
-        while ip rule del from $old_ip table $rt_table 2>/dev/null; do :; done
-        
-        # Remove from ipset
-        ipset del $ipset_name $old_ip 2>/dev/null
-        ipset del $ipset_name_v6 $old_ip 2>/dev/null
-    else
-        logger -t wg-dhcp-cleanup "[$iface] Removing rules for $mac (IP unknown)"
-    fi
-
-    # Remove Killswitch rules
-    while iptables -D "${iface}_killswitch" -m mac --mac-source $mac -j REJECT 2>/dev/null; do :; done
-    while ip6tables -D "${iface}_killswitch" -m mac --mac-source $mac -j REJECT 2>/dev/null; do :; done
-
-    # Remove IPv6 block rules (try both formats)
-    while ip6tables -D $block_chain -m mac --mac-source $mac -j DROP 2>/dev/null; do :; done
-    # Clean up loop for new format block rules (might match multiple LAN interfaces)
+    
+    # Remove IPv6 fwmark (NAT66 mode) - loop to remove all duplicates
+    while ip6tables -t mangle -D $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE 2>/dev/null; do :; done
+    
+    # Remove IPv6 block rules (both old and new format) - loop to remove all duplicates
     local lan_ifaces=$(get_lan_ifaces)
     for lan_if in $lan_ifaces; do
-         while ip6tables -D $block_chain -i $lan_if -m mac --mac-source $mac -m mark ! --mark $((0x10000 + rt_table)) -j DROP 2>/dev/null; do :; done
+        while ip6tables -D $BLOCK_CHAIN -i $lan_if ! -o $iface -m mac --mac-source $mac -j DROP 2>/dev/null; do :; done
+        while ip6tables -D $BLOCK_CHAIN -i $lan_if -m mac --mac-source $mac -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null; do :; done
     done
-
-    # Remove IPv6 mark rule
-    while ip6tables -t mangle -D $mark_chain_v6 -m mac --mac-source $mac -j MARK --set-mark $((0x10000 + rt_table)) 2>/dev/null; do :; done
-    
-    # Remove IPv6 DNS block (UDP and TCP)
-    while ip6tables -D $input_block_chain -m mac --mac-source $mac -p udp --dport 53 -j REJECT 2>/dev/null; do :; done
-    while ip6tables -D $input_block_chain -m mac --mac-source $mac -p tcp --dport 53 -j REJECT 2>/dev/null; do :; done
-
-    # Remove IPv4-only block rules (if applicable)
-    while ip6tables -D $ipv4_block_chain -m mac --mac-source $mac -j REJECT 2>/dev/null; do :; done
-    
-    # Remove IPv6 acquisition blocking (RA/DHCPv6)
+    # Loop to remove all IPv4-only block rules (may have duplicates from multiple sources)
+    while ip6tables -D $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP 2>/dev/null; do :; done
     while ip6tables -D INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null; do :; done
     while ip6tables -D INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP 2>/dev/null; do :; done
-
-    # Remove legacy state file if exists
-    rm -f "${WG_TMP_DIR}/client_${iface}_${mac//:/}"
+    while ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p udp --dport 53 -j REJECT 2>/dev/null; do :; done
+    while ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT 2>/dev/null; do :; done
+    
+    # Remove IPv6 routing rule using state file
+    local STATE_FILE="${WG_TMP_DIR}/prefix_${iface}_${mac//:/}"
+    if [ -f "$STATE_FILE" ]; then
+        local OLD_RULE=$(cat "$STATE_FILE")
+        if [ -n "$OLD_RULE" ]; then
+            if echo "$OLD_RULE" | grep -q '/'; then
+                ip -6 rule del from "$OLD_RULE" table $rt 2>/dev/null
+            else
+                ip -6 rule del from "${OLD_RULE}::/64" table $rt 2>/dev/null
+            fi
+        fi
+        rm -f "$STATE_FILE"
+    fi
+    
+    # Flush route cache to apply changes immediately
+    ip -6 route flush cache 2>/dev/null
+    
+    logger -t wg-dhcp-master "[$iface] Cleaned up roaming client $mac"
 }
 
 # === FIND MATCHING INTERFACE ===
@@ -325,14 +317,14 @@ if [ -n "$MATCHED_IFACE" ]; then
     
     # Check if tunnel interface exists
     if ifconfig | grep -q "$WG_INTERFACE"; then
-
+        logger -t wg-dhcp-master "[$WG_INTERFACE] New client $IPADDR ($MACADDR) detected. Applying VPN routing rules."
         
         # Ensure DNS blocking chain exists (defensive - in case ifup didn't create it)
-        ip6tables -N $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null
-        ip6tables -C INPUT -j $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null || ip6tables -I INPUT 1 -j $BLOCK_IPV6_DNS_INPUT_CHAIN
+        ip6tables -w -N $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null
+        ip6tables -w -C INPUT -j $BLOCK_IPV6_DNS_INPUT_CHAIN 2>/dev/null || ip6tables -w -I INPUT 1 -j $BLOCK_IPV6_DNS_INPUT_CHAIN
         
-        iptables -D $KS_CHAIN -s $IPADDR -j REJECT 2>/dev/null
-        ip6tables -D $KS_CHAIN -m mac --mac-source $MACADDR -j REJECT 2>/dev/null
+        iptables -w -D $KS_CHAIN -s $IPADDR -j REJECT 2>/dev/null
+        ip6tables -w -D $KS_CHAIN -m mac --mac-source $MACADDR -j REJECT 2>/dev/null
         ip rule del from $IPADDR table $ROUTING_TABLE 2>/dev/null
         ip rule add from $IPADDR table $ROUTING_TABLE priority $ROUTING_TABLE
         echo "$IPADDR" > "${WG_TMP_DIR}/ip_${WG_INTERFACE}_${MACADDR//:/}"
@@ -343,81 +335,70 @@ if [ -n "$MATCHED_IFACE" ]; then
             MARK_VALUE="$((0x10000 + ROUTING_TABLE))"
             
             # Ensure IPv6 marking chain exists (defensive - in case ifup didn't create it)
-            ip6tables -t mangle -N $IPV6_MARK_CHAIN 2>/dev/null
+            ip6tables -w -t mangle -N $IPV6_MARK_CHAIN 2>/dev/null
             lan_ifaces=$(get_lan_ifaces)
             for lan_if in $lan_ifaces; do
-                ip6tables -t mangle -C PREROUTING -i $lan_if -j $IPV6_MARK_CHAIN 2>/dev/null || \
-                    ip6tables -t mangle -A PREROUTING -i $lan_if -j $IPV6_MARK_CHAIN
+                ip6tables -w -t mangle -C PREROUTING -i $lan_if -j $IPV6_MARK_CHAIN 2>/dev/null || \
+                    ip6tables -w -t mangle -A PREROUTING -i $lan_if -j $IPV6_MARK_CHAIN
             done
             
             # IMPORTANT: Add block rule FIRST to prevent IPv6 leak during setup
             # Ensure BLOCK_CHAIN exists and is linked to FORWARD (defensive)
-            ip6tables -N $BLOCK_CHAIN 2>/dev/null
-            ip6tables -C FORWARD -j $BLOCK_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $BLOCK_CHAIN
+            ip6tables -w -N $BLOCK_CHAIN 2>/dev/null
+            ip6tables -w -C FORWARD -j $BLOCK_CHAIN 2>/dev/null || ip6tables -w -I FORWARD 1 -j $BLOCK_CHAIN
             
             # Ensure Leak Prevention (Block non-VPN traffic) is ACTIVE
             for lan_if in $lan_ifaces; do 
                 # Remove old rules (both formats for backward compatibility)
-                ip6tables -D $BLOCK_CHAIN -i $lan_if ! -o $WG_INTERFACE -m mac --mac-source $MACADDR -j DROP 2>/dev/null
-                ip6tables -D $BLOCK_CHAIN -i $lan_if -m mac --mac-source $MACADDR -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
+                ip6tables -w -D $BLOCK_CHAIN -i $lan_if ! -o $WG_INTERFACE -m mac --mac-source $MACADDR -j DROP 2>/dev/null
+                ip6tables -w -D $BLOCK_CHAIN -i $lan_if -m mac --mac-source $MACADDR -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null
                 # Add new rule: block unmarked traffic (allows fwmark-routed traffic through)
-                ip6tables -I $BLOCK_CHAIN 1 -i $lan_if -m mac --mac-source $MACADDR -m mark ! --mark $MARK_VALUE -j DROP
+                ip6tables -w -I $BLOCK_CHAIN 1 -i $lan_if -m mac --mac-source $MACADDR -m mark ! --mark $MARK_VALUE -j DROP
             done
             
             # NOW add marking rule (after block is in place, any traffic before this is blocked safely)
-            if ! ip6tables -t mangle -C $IPV6_MARK_CHAIN -m mac --mac-source $MACADDR -j MARK --set-mark $MARK_VALUE 2>/dev/null; then
-                ip6tables -t mangle -A $IPV6_MARK_CHAIN -m mac --mac-source $MACADDR -j MARK --set-mark $MARK_VALUE
+            if ! ip6tables -w -t mangle -C $IPV6_MARK_CHAIN -m mac --mac-source $MACADDR -j MARK --set-mark $MARK_VALUE 2>/dev/null; then
+                ip6tables -w -t mangle -A $IPV6_MARK_CHAIN -m mac --mac-source $MACADDR -j MARK --set-mark $MARK_VALUE
                 logger -t wg-dhcp-master "[$WG_INTERFACE] Added IPv6 fwmark for MAC $MACADDR (Universal roaming)"
             fi
             
-            # Dynamic IPSet update for IPv6 (if address available, though mainly we need to add to ipset for DNS rules)
-            # Since this is dual-stack script, we should add IPADDR to IPv4 ipset here for consistency? No, do it outside.
-            # But for IPv6, we usually rely on prefix delegation or SLAAC. If we have a known IPv6 address:
-            # Note: DHCP script primarily deals with IPv4 events. The IPv6 address might not be known here.
-            # However, for dual-stack DNS hijacking, we need the IPv4 address in the IPv4 ipset.
-
             # Proactive ping to populate neighbor table
             (
                 ping -c 2 -W 1 "$IPADDR" >/dev/null 2>&1 &
             ) &
             
-
+            logger -t wg-dhcp-master "[$WG_INTERFACE] IPv6 routing active via fwmark for $MACADDR"
         else
             # IPv4-only tunnel: Block IPv6 for this client
-
+            logger -t wg-dhcp-master "[$WG_INTERFACE] Blocking IPv6 for $IPADDR ($MACADDR) on IPv4-only tunnel."
             
             # Ensure blocking chain exists (defensive)
-            ip6tables -N $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null
-            ip6tables -C FORWARD -j $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $BLOCK_IPV4_ONLY_CHAIN
+            ip6tables -w -N $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null
+            ip6tables -w -C FORWARD -j $BLOCK_IPV4_ONLY_CHAIN 2>/dev/null || ip6tables -w -I FORWARD 1 -j $BLOCK_IPV4_ONLY_CHAIN
             
-            ip6tables -C $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $MACADDR -j REJECT 2>/dev/null || \
-                ip6tables -I $BLOCK_IPV4_ONLY_CHAIN 1 -m mac --mac-source $MACADDR -j REJECT
-        fi
-
-        # CRITICAL: Add client to Interface IPSet to enable DNS Hijacking and Leak Protection
-        # This ensures dynamic clients get the same DNS rules as static clients.
-        IPSET_NAME="vpn_${WG_INTERFACE}"
-
-        ipset add $IPSET_NAME $IPADDR 2>/dev/null || true    
+            ip6tables -w -C $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $MACADDR -j DROP 2>/dev/null || \
+                ip6tables -w -A $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $MACADDR -j DROP
+            
             # Block IPv6 acquisition (RS and DHCPv6)
-            ip6tables -C INPUT -m mac --mac-source $MACADDR -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null || \
-                ip6tables -A INPUT -m mac --mac-source $MACADDR -p icmpv6 --icmpv6-type 133 -j DROP
-            ip6tables -C INPUT -m mac --mac-source $MACADDR -p udp --dport 547 -j DROP 2>/dev/null || \
-                ip6tables -A INPUT -m mac --mac-source $MACADDR -p udp --dport 547 -j DROP
+            ip6tables -w -C INPUT -m mac --mac-source $MACADDR -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null || \
+                ip6tables -w -A INPUT -m mac --mac-source $MACADDR -p icmpv6 --icmpv6-type 133 -j DROP
+            ip6tables -w -C INPUT -m mac --mac-source $MACADDR -p udp --dport 547 -j DROP 2>/dev/null || \
+                ip6tables -w -A INPUT -m mac --mac-source $MACADDR -p udp --dport 547 -j DROP
+        fi
         
         # Block IPv6 DNS to router for this client
-        ip6tables -C $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p udp --dport 53 -j REJECT 2>/dev/null || \
-            ip6tables -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p udp --dport 53 -j REJECT
-        ip6tables -C $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p tcp --dport 53 -j REJECT 2>/dev/null || \
-            ip6tables -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p tcp --dport 53 -j REJECT
+        ip6tables -w -C $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p udp --dport 53 -j REJECT 2>/dev/null || \
+            ip6tables -w -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p udp --dport 53 -j REJECT
+        ip6tables -w -C $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p tcp --dport 53 -j REJECT 2>/dev/null || \
+            ip6tables -w -A $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $MACADDR -p tcp --dport 53 -j REJECT
     else
         # Tunnel is down - apply kill switch
-
-        iptables -N $KS_CHAIN 2>/dev/null; ip6tables -N $KS_CHAIN 2>/dev/null
-        iptables -C FORWARD -j $KS_CHAIN 2>/dev/null || iptables -I FORWARD 1 -j $KS_CHAIN
-        ip6tables -C FORWARD -j $KS_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $KS_CHAIN
-        iptables -A $KS_CHAIN -s $IPADDR -j REJECT --reject-with icmp-host-prohibited
-        ip6tables -A $KS_CHAIN -m mac --mac-source $MACADDR -j REJECT --reject-with icmp6-adm-prohibited
+        logger -t wg-dhcp-master "[$WG_INTERFACE] New client $IPADDR ($MACADDR) detected, but tunnel is down. Applying kill switch."
+        iptables -w -N $KS_CHAIN 2>/dev/null; ip6tables -w -N $KS_CHAIN 2>/dev/null
+        iptables -w -C FORWARD -j $KS_CHAIN 2>/dev/null || iptables -w -I FORWARD 1 -j $KS_CHAIN
+        ip6tables -w -C FORWARD -j $KS_CHAIN 2>/dev/null || ip6tables -w -I FORWARD 1 -j $KS_CHAIN
+        iptables -w -A $KS_CHAIN -s $IPADDR -j REJECT --reject-with icmp-host-prohibited
+        ip6tables -w -A $KS_CHAIN -m mac --mac-source $MACADDR -j REJECT --reject-with icmp6-adm-prohibited
     fi
     
     # Update MAC state in SQLite

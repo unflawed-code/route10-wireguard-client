@@ -70,6 +70,21 @@ else
     echo "[WARN] OUTPUT chain DNS marking rules missing for split-tunnel"
 fi
 
+# Check for OUTPUT chain IPSET marking (Router-originated traffic)
+IPSET_NAME="dst_vpn_${INTERFACE}"
+if iptables -t mangle -S OUTPUT 2>/dev/null | grep -q -- "match-set $IPSET_NAME dst -j MARK"; then
+    echo "[PASS] OUTPUT chain IPSET marking rules exist (IPv4)"
+else
+    echo "[FAIL] OUTPUT chain IPSET marking rules missing (IPv4) - Router traffic will leak!"
+fi
+
+if ip6tables -t mangle -S OUTPUT 2>/dev/null | grep -q -- "match-set dst6_vpn_${INTERFACE} dst -j MARK"; then
+    echo "[PASS] OUTPUT chain IPSET marking rules exist (IPv6)"
+else
+    # Only fail if IPv6 support is expected/active, but valid for check
+    echo "[INFO] OUTPUT chain IPSET marking rules missing (IPv6) - Check if IPv6 supported"
+fi
+
 # 4. Firewall Forwarding
 if iptables -S FORWARD | grep -q -- "-o $INTERFACE -j ACCEPT"; then
     echo "[PASS] Firewall FORWARD allow rule exists"

@@ -151,13 +151,13 @@ get_dhcp_lease_file() {
 cleanup_iptables_chain() {
     local table="$1" parent="$2" chain="$3"
     if [ "$table" = "filter" ]; then
-        iptables -D "$parent" -j "$chain" 2>/dev/null
-        iptables -F "$chain" 2>/dev/null
-        iptables -X "$chain" 2>/dev/null
+        iptables -w -D "$parent" -j "$chain" 2>/dev/null
+        iptables -w -F "$chain" 2>/dev/null
+        iptables -w -X "$chain" 2>/dev/null
     else
-        iptables -t "$table" -D "$parent" -j "$chain" 2>/dev/null
-        iptables -t "$table" -F "$chain" 2>/dev/null
-        iptables -t "$table" -X "$chain" 2>/dev/null
+        iptables -w -t "$table" -D "$parent" -j "$chain" 2>/dev/null
+        iptables -w -t "$table" -F "$chain" 2>/dev/null
+        iptables -w -t "$table" -X "$chain" 2>/dev/null
     fi
 }
 
@@ -167,13 +167,13 @@ cleanup_iptables_chain() {
 cleanup_ip6tables_chain() {
     local table="$1" parent="$2" chain="$3"
     if [ "$table" = "filter" ]; then
-        ip6tables -D "$parent" -j "$chain" 2>/dev/null
-        ip6tables -F "$chain" 2>/dev/null
-        ip6tables -X "$chain" 2>/dev/null
+        ip6tables -w -D "$parent" -j "$chain" 2>/dev/null
+        ip6tables -w -F "$chain" 2>/dev/null
+        ip6tables -w -X "$chain" 2>/dev/null
     else
-        ip6tables -t "$table" -D "$parent" -j "$chain" 2>/dev/null
-        ip6tables -t "$table" -F "$chain" 2>/dev/null
-        ip6tables -t "$table" -X "$chain" 2>/dev/null
+        ip6tables -w -t "$table" -D "$parent" -j "$chain" 2>/dev/null
+        ip6tables -w -t "$table" -F "$chain" 2>/dev/null
+        ip6tables -w -t "$table" -X "$chain" 2>/dev/null
     fi
 }
 
@@ -248,7 +248,7 @@ cleanup_interface_rules() {
     # Clean up per-client MAC marks from mangle table
     local IPV6_MARK_CHAIN="mark_ipv6_${INTERFACE_NAME}"
     echo "  Flushing ip6tables mangle chain: $IPV6_MARK_CHAIN"
-    ip6tables -t mangle -F "$IPV6_MARK_CHAIN" 2>/dev/null || true
+    ip6tables -w -t mangle -F "$IPV6_MARK_CHAIN" 2>/dev/null || true
     
     # Clean up MAC state entries for this interface (from SQLite)
     echo "  Removing MAC state entries for $INTERFACE_NAME"
@@ -306,12 +306,12 @@ cleanup_mac_for_ip() {
         # Last ditch effort: if we have a MAC but no table, we try to scrub it from the known marks chain 
         # using a grep-and-delete approach to be robust
         local mark_chain="mark_ipv6_${iface}"
-        if ip6tables -t mangle -L "$mark_chain" -n >/dev/null 2>&1; then
+        if ip6tables -w -t mangle -L "$mark_chain" -n >/dev/null 2>&1; then
             echo "  WARNING: MAC discovered for $removed_ip but routing table unknown. Attempting bulk scrub."
             # Find and delete any rule matching this MAC in this chain
-            while ip6tables -t mangle -S "$mark_chain" | grep -q "$mac"; do
-                local rule_spec=$(ip6tables -t mangle -S "$mark_chain" | grep "$mac" | head -1 | sed 's/-A/-D/')
-                ip6tables -t mangle $rule_spec 2>/dev/null || break
+            while ip6tables -w -t mangle -S "$mark_chain" | grep -q "$mac"; do
+                local rule_spec=$(ip6tables -w -t mangle -S "$mark_chain" | grep "$mac" | head -1 | sed 's/-A/-D/')
+                ip6tables -w -t mangle $rule_spec 2>/dev/null || break
             done
         fi
         return 0
@@ -325,42 +325,42 @@ cleanup_mac_for_ip() {
     local BLOCK_IPV6_DNS_INPUT_CHAIN="${iface}_v6_dns_in"
     
     # Remove IPv6 fwmark rule - Try both MARK and XMARK versions for resilience
-    ip6tables -t mangle -D $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
-    ip6tables -t mangle -D $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-xmark $(printf "0x%x" $MARK_VALUE)/0xffffffff 2>/dev/null || true
+    ip6tables -w -t mangle -D $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-mark $MARK_VALUE 2>/dev/null || true
+    ip6tables -w -t mangle -D $IPV6_MARK_CHAIN -m mac --mac-source $mac -j MARK --set-xmark $(printf "0x%x" $MARK_VALUE)/0xffffffff 2>/dev/null || true
     
     # Remove IPv6 block rules
     local lan_ifaces=$(get_lan_ifaces)
     for lan_if in $lan_ifaces; do
-        ip6tables -D $BLOCK_CHAIN -i $lan_if -m mac --mac-source $mac -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null || true
+        ip6tables -w -D $BLOCK_CHAIN -i $lan_if -m mac --mac-source $mac -m mark ! --mark $MARK_VALUE -j DROP 2>/dev/null || true
     done
     
     # Remove IPv4-only block rules
-    ip6tables -D $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP 2>/dev/null || true
-    ip6tables -D INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null || true
-    ip6tables -D INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP 2>/dev/null || true
+    ip6tables -w -D $BLOCK_IPV4_ONLY_CHAIN -m mac --mac-source $mac -j DROP 2>/dev/null || true
+    ip6tables -w -D INPUT -m mac --mac-source $mac -p icmpv6 --icmpv6-type 133 -j DROP 2>/dev/null || true
+    ip6tables -w -D INPUT -m mac --mac-source $mac -p udp --dport 547 -j DROP 2>/dev/null || true
     
     # Remove IPv6 DNS block rules
-    ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p udp --dport 53 -j REJECT 2>/dev/null || true
-    ip6tables -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT 2>/dev/null || true
+    ip6tables -w -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p udp --dport 53 -j REJECT 2>/dev/null || true
+    ip6tables -w -D $BLOCK_IPV6_DNS_INPUT_CHAIN -m mac --mac-source $mac -p tcp --dport 53 -j REJECT 2>/dev/null || true
     
     # Remove IPv4 DNS block rules (filter chains for DoT/DoH blocking)
     local dns_block_chain="vpn_dns_block_${iface}"
     local dns_filter_chain="vpn_dns_filter_${iface}"
     
     # Clean up DNS block rules by IP (port 53 blocking)
-    iptables -D $dns_block_chain -s $removed_ip -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
-    iptables -D $dns_block_chain -s $removed_ip -p tcp --dport 53 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+    iptables -w -D $dns_block_chain -s $removed_ip -p udp --dport 53 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+    iptables -w -D $dns_block_chain -s $removed_ip -p tcp --dport 53 -j REJECT --reject-with tcp-reset 2>/dev/null || true
     
     # Clean up DoT block rules by IP (port 853)
-    iptables -D $dns_filter_chain -s $removed_ip -p udp --dport 853 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
-    iptables -D $dns_filter_chain -s $removed_ip -p tcp --dport 853 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+    iptables -w -D $dns_filter_chain -s $removed_ip -p udp --dport 853 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+    iptables -w -D $dns_filter_chain -s $removed_ip -p tcp --dport 853 -j REJECT --reject-with tcp-reset 2>/dev/null || true
     
     # Clean up DoH block rules by IP (port 443 with string matching)
     if [ -f /etc/config/https-dns-proxy ]; then
         local domains=$(grep 'resolver_url' /etc/config/https-dns-proxy 2>/dev/null | awk -F'/' '{print $3}')
         for domain in $domains; do
-            iptables -D $dns_filter_chain -s $removed_ip -p tcp --dport 443 -m string --algo bm --string "$domain" -j REJECT --reject-with tcp-reset 2>/dev/null || true
-            iptables -D $dns_filter_chain -s $removed_ip -p udp --dport 443 -m string --algo bm --string "$domain" -j REJECT --reject-with tcp-reset 2>/dev/null || true
+            iptables -w -D $dns_filter_chain -s $removed_ip -p tcp --dport 443 -m string --algo bm --string "$domain" -j REJECT --reject-with tcp-reset 2>/dev/null || true
+            iptables -w -D $dns_filter_chain -s $removed_ip -p udp --dport 443 -m string --algo bm --string "$domain" -j REJECT --reject-with tcp-reset 2>/dev/null || true
         done
     fi
     
@@ -421,9 +421,9 @@ update_ipset_targets() {
             
             # Remove DNS DNAT rules for this IP (prevents DNAT conflicts when IP moves to another interface)
             local dns_nat_chain="vpn_dns_nat_${iface}"
-            while iptables -t nat -L "$dns_nat_chain" --line-numbers -n 2>/dev/null | grep -q "^[0-9].*${old_ip}"; do
-                local line_num=$(iptables -t nat -L "$dns_nat_chain" --line-numbers -n 2>/dev/null | grep "^[0-9].*${old_ip}" | head -1 | awk '{print $1}')
-                [ -n "$line_num" ] && iptables -t nat -D "$dns_nat_chain" "$line_num" 2>/dev/null && echo "  Removed DNS DNAT rule $line_num for $old_ip" || true
+            while iptables -w -t nat -L "$dns_nat_chain" --line-numbers -n 2>/dev/null | grep -q "^[0-9].*${old_ip}"; do
+                local line_num=$(iptables -w -t nat -L "$dns_nat_chain" --line-numbers -n 2>/dev/null | grep "^[0-9].*${old_ip}" | head -1 | awk '{print $1}')
+                [ -n "$line_num" ] && iptables -w -t nat -D "$dns_nat_chain" "$line_num" 2>/dev/null && echo "  Removed DNS DNAT rule $line_num for $old_ip" || true
             done
             
             # Clean up MAC state and IPv6 firewall rules for this IP
@@ -468,13 +468,13 @@ update_ipset_targets() {
     local dns_nat_chain="vpn_dns_nat_${iface}"
     
     # Ensure DNS NAT chain is hooked into PREROUTING
-    if iptables -t nat -L "$dns_nat_chain" -n >/dev/null 2>&1; then
-        iptables -t nat -C PREROUTING -j "$dns_nat_chain" 2>/dev/null || \
-            iptables -t nat -I PREROUTING 1 -j "$dns_nat_chain"
+    if iptables -w -t nat -L "$dns_nat_chain" -n >/dev/null 2>&1; then
+        iptables -w -t nat -C PREROUTING -j "$dns_nat_chain" 2>/dev/null || \
+            iptables -w -t nat -I PREROUTING 1 -j "$dns_nat_chain"
     fi
     
     # Get DNS server from existing rules in this chain
-    local dns_server=$(iptables -t nat -L "$dns_nat_chain" -n 2>/dev/null | \
+    local dns_server=$(iptables -w -t nat -L "$dns_nat_chain" -n 2>/dev/null | \
         grep -oE 'to:[0-9.]+' | head -1 | cut -d: -f2)
     
     if [ -n "$dns_server" ]; then
@@ -486,9 +486,9 @@ update_ipset_targets() {
                     *:*) ;; # Skip IPv6
                     *)
                         # Check if rule already exists
-                        if ! iptables -t nat -C "$dns_nat_chain" -s "$actual_ip" -p udp --dport 53 -j DNAT --to-destination "$dns_server" 2>/dev/null; then
-                            iptables -t nat -A "$dns_nat_chain" -s "$actual_ip" -p udp --dport 53 -j DNAT --to-destination "$dns_server" || true
-                            iptables -t nat -A "$dns_nat_chain" -s "$actual_ip" -p tcp --dport 53 -j DNAT --to-destination "$dns_server" || true
+                        if ! iptables -w -t nat -C "$dns_nat_chain" -s "$actual_ip" -p udp --dport 53 -j DNAT --to-destination "$dns_server" 2>/dev/null; then
+                            iptables -w -t nat -A "$dns_nat_chain" -s "$actual_ip" -p udp --dport 53 -j DNAT --to-destination "$dns_server" || true
+                            iptables -w -t nat -A "$dns_nat_chain" -s "$actual_ip" -p tcp --dport 53 -j DNAT --to-destination "$dns_server" || true
                             echo "  Added DNS DNAT: $actual_ip -> $dns_server"
                         fi
                         ;;

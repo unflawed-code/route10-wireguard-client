@@ -103,29 +103,29 @@ delete_wg_interface() {
     # Unlink and flush IPv4 chains
     for table in mangle nat filter; do
         for chain in $mark_chain $ks_chain $dns_nat_chain $dns_filter_chain $dns_block_chain $split_chain; do
-            iptables -t $table -F "$chain" 2>/dev/null || true
-            iptables -t $table -D PREROUTING -j "$chain" 2>/dev/null || true
-            iptables -t $table -D FORWARD -j "$chain" 2>/dev/null || true
-            iptables -t $table -D INPUT -j "$chain" 2>/dev/null || true
-            iptables -t $table -D OUTPUT -j "$chain" 2>/dev/null || true
-            iptables -t $table -X "$chain" 2>/dev/null || true
+            iptables -w -t $table -F "$chain" 2>/dev/null || true
+            iptables -w -t $table -D PREROUTING -j "$chain" 2>/dev/null || true
+            iptables -w -t $table -D FORWARD -j "$chain" 2>/dev/null || true
+            iptables -w -t $table -D INPUT -j "$chain" 2>/dev/null || true
+            iptables -w -t $table -D OUTPUT -j "$chain" 2>/dev/null || true
+            iptables -w -t $table -X "$chain" 2>/dev/null || true
         done
         # Special case for split-tunnel: cleanup any lingering OUTPUT rules by target IP if found
         # (Though usually iptables -X handles unlinked chains, we explicitly marked OUTPUT 1)
-        iptables -t mangle -D OUTPUT -j "$split_chain" 2>/dev/null || true
+        iptables -w -t mangle -D OUTPUT -j "$split_chain" 2>/dev/null || true
     done
     
     # Unlink and flush IPv6 chains
     for table in mangle nat filter; do
         for chain in $mark_ipv6_chain $ks_chain $block_chain $ipv4_only_block_chain $v6_dns_in_chain $nat66_chain $dns_nat6_chain $dns_filter6_chain $dns_block6_chain $split_chain; do
-            ip6tables -t $table -F "$chain" 2>/dev/null || true
-            ip6tables -t $table -D PREROUTING -j "$chain" 2>/dev/null || true
-            ip6tables -t $table -D FORWARD -j "$chain" 2>/dev/null || true
-            ip6tables -t $table -D INPUT -j "$chain" 2>/dev/null || true
-            ip6tables -t $table -D OUTPUT -j "$chain" 2>/dev/null || true
-            ip6tables -t $table -X "$chain" 2>/dev/null || true
+            ip6tables -w -t $table -F "$chain" 2>/dev/null || true
+            ip6tables -w -t $table -D PREROUTING -j "$chain" 2>/dev/null || true
+            ip6tables -w -t $table -D FORWARD -j "$chain" 2>/dev/null || true
+            ip6tables -w -t $table -D INPUT -j "$chain" 2>/dev/null || true
+            ip6tables -w -t $table -D OUTPUT -j "$chain" 2>/dev/null || true
+            ip6tables -w -t $table -X "$chain" 2>/dev/null || true
         done
-        ip6tables -t mangle -D OUTPUT -j "$split_chain" 2>/dev/null || true
+        ip6tables -w -t mangle -D OUTPUT -j "$split_chain" 2>/dev/null || true
     done
     
     # 5. Clean up routing rules
@@ -173,7 +173,6 @@ delete_wg_interface() {
     rm -f "${wg_tmp_dir}/ip_${iface}_"* 2>/dev/null || true
     rm -f "/tmp/dnsmasq.d/99-${iface}-dns.conf" 2>/dev/null || true
     
-    # 10. Purge from database
     # 10. Purge from database
     if [ -f "$db_path" ]; then
         echo "  Purging database entries..."
