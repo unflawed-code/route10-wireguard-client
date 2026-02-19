@@ -48,7 +48,7 @@
     
     # Remove dnsmasq stub config
     rm -f "/tmp/dnsmasq.d/INTERFACE_PLACEHOLDER-split-stub.conf"
-    /etc/init.d/dnsmasq restart
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
     
     logger -t wg-split-tunnel "[INTERFACE_PLACEHOLDER] Cleanup complete"
     exit 0

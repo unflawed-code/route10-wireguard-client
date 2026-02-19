@@ -51,7 +51,7 @@ delete_wg_interface() {
     # 2. Bring down the interface (this triggers the hotplug cleanup script)
     if ip link show "$iface" >/dev/null 2>&1; then
         echo "  Bringing down interface $iface..."
-        ifdown "$iface" 2>/dev/null || true
+        ifdown "$iface" >/dev/null 2>&1 || true
         # Give it a second to run hotplug
         sleep 1
         
@@ -194,5 +194,5 @@ delete_wg_interface() {
     
     echo "Done - $iface deleted and cleaned up"
     # Reload dnsmasq to pick up removed config
-    [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq reload 2>/dev/null || true
+    [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
 }

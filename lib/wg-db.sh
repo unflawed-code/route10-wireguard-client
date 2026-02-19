@@ -3,6 +3,13 @@
 # This provides atomic operations for staging and registry data
 
 WG_DB_PATH="${WG_TMP_DIR:-/tmp/wg-custom}/wg_pbr.db"
+WG_DB_BUSY_TIMEOUT_MS="${WG_DB_BUSY_TIMEOUT_MS:-5000}"
+
+# Wrap sqlite3 with busy timeout to reduce transient lock failures
+# during concurrent commit/hotplug activity.
+sqlite3() {
+    command sqlite3 -cmd ".timeout ${WG_DB_BUSY_TIMEOUT_MS}" "$@"
+}
 
 # Initialize database and create tables
 db_init() {

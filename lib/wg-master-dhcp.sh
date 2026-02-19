@@ -7,6 +7,12 @@ mkdir -p "$WG_TMP_DIR" 2>/dev/null || true
 WG_DB_PATH="${WG_TMP_DIR}/wg_pbr.db"
 WG_MAC_STATE="${WG_TMP_DIR}/mac_state"
 LOCK_FILE="${WG_TMP_DIR}/dhcp_hotplug.lock"
+WG_DB_BUSY_TIMEOUT_MS="${WG_DB_BUSY_TIMEOUT_MS:-5000}"
+
+# Use busy timeout to avoid failing on short DB write contention with commits.
+sqlite3() {
+    command sqlite3 -cmd ".timeout ${WG_DB_BUSY_TIMEOUT_MS}" "$@"
+}
 
 [ "$ACTION" = "add" ] || [ "$ACTION" = "new" ] || [ "$ACTION" = "old" ] || [ "$ACTION" = "update" ] || exit 0
 [ -f "$WG_DB_PATH" ] || exit 0

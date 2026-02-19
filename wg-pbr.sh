@@ -486,6 +486,72 @@ fi
 # Wait for system to be ready if uptime is less than 60 seconds (staging path)
 wait_for_system_ready
 
+# Detect IPv6 capability for split-tunnel staging so status reflects real config.
+detect_split_ipv6_state() {
+    local cfg="$1"
+    SPLIT_IPV6_SUPPORTED=0
+    SPLIT_IPV6_SUBNETS=""
+    SPLIT_IPV6_NEEDS_NAT66=0
+
+    [ -f "$cfg" ] || return 0
+
+    local iface_ip6
+    iface_ip6=$(awk '
+        BEGIN { sec="" }
+        {
+            line=$0
+            sub(/#.*/, "", line)
+            gsub(/^[ \t]+|[ \t]+$/, "", line)
+            if (line == "") next
+            if (line ~ /^\[/) { sec=line; next }
+            if (sec == "[Interface]" && line ~ /^Address[ \t]*=/) {
+                sub(/^Address[ \t]*=[ \t]*/, "", line)
+                gsub(/[ \t]/, "", line)
+                n=split(line, a, ",")
+                for (i=1; i<=n; i++) if (a[i] ~ /:/) print a[i]
+            }
+        }
+    ' "$cfg")
+
+    if [ -n "$iface_ip6" ]; then
+        SPLIT_IPV6_SUPPORTED=1
+        for ip6 in $iface_ip6; do
+            case "$ip6" in
+                */*)
+                    local prefix="${ip6##*/}"
+                    if [ "$prefix" = "128" ]; then
+                        SPLIT_IPV6_NEEDS_NAT66=1
+                    else
+                        [ -n "$SPLIT_IPV6_SUBNETS" ] && SPLIT_IPV6_SUBNETS="${SPLIT_IPV6_SUBNETS} "
+                        SPLIT_IPV6_SUBNETS="${SPLIT_IPV6_SUBNETS}${ip6}"
+                    fi
+                    ;;
+                *)
+                    SPLIT_IPV6_NEEDS_NAT66=1
+                    ;;
+            esac
+        done
+        return 0
+    fi
+
+    if awk '
+        BEGIN { sec="" }
+        {
+            line=$0
+            sub(/#.*/, "", line)
+            gsub(/^[ \t]+|[ \t]+$/, "", line)
+            if (line == "") next
+            if (line ~ /^\[/) { sec=line; next }
+            if (sec == "[Peer]" && line ~ /^AllowedIPs[ \t]*=/ && line ~ /::/) {
+                found=1
+            }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$cfg"; then
+        SPLIT_IPV6_SUPPORTED=1
+    fi
+}
+
 # Split-tunnel mode: stage for commit (not immediate execution)
 if [ -n "$SPLIT_TUNNEL_DOMAINS" ]; then
     # Validate: -d is incompatible with -t and -r
@@ -519,6 +585,8 @@ if [ -n "$SPLIT_TUNNEL_DOMAINS" ]; then
     
     # Stage split-tunnel configuration to DB
     db_set_staged_split_tunnel "$INTERFACE_NAME" "$CONFIG_FILE_ABS" "$ROUTING_TABLE_OVERRIDE" "$SPLIT_TUNNEL_DOMAINS"
+    detect_split_ipv6_state "$CONFIG_FILE_ABS"
+    db_set_ipv6 "$INTERFACE_NAME" "$SPLIT_IPV6_SUPPORTED" "$SPLIT_IPV6_SUBNETS" "$SPLIT_IPV6_NEEDS_NAT66"
     
     echo "Split-tunnel configuration staged for $INTERFACE_NAME (table: $ROUTING_TABLE_OVERRIDE)"
     echo "  Domains: $SPLIT_TUNNEL_DOMAINS"

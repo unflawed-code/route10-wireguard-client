@@ -11,7 +11,7 @@ SCRIPT_DIR="$(dirname "$0")"
 
 log() {
     logger -t wg-split-tunnel "[$INTERFACE] $1"
-    echo "$1"
+    echo "$1" >&2
 }
 
 cleanup() {
@@ -485,8 +485,8 @@ setup_pbr() {
         ip6tables -w -t mangle -A "$split_chain" -m set --match-set "$vpn_set" src -j RETURN
         log "Skipping VPN ipset: $vpn_set (IPv6)"
     done
-    # IPv6: Also skip by MAC address - wg-pbr.sh uses mark_ipv6_* chains with MAC matching
-    for mac in $(ip6tables -w -t mangle -S 2>/dev/null | grep 'mark_ipv6_' | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | sort -u); do
+    # IPv6: Also skip by MAC address from both legacy and vpn-core mark chains
+    for mac in $(ip6tables -w -t mangle -S 2>/dev/null | grep -E 'mark_ipv6_|mark_' | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | sort -u); do
         ip6tables -w -t mangle -A "$split_chain" -m mac --mac-source "$mac" -j RETURN
         log "Skipping VPN MAC: $mac (IPv6)"
     done

@@ -187,6 +187,16 @@ cmd_status() {
             pub_ipv4=$(curl -4 -s --max-time 2 --interface "$iface" ifconfig.me 2>/dev/null)
         fi
     fi
+
+    # Backward-compatible IPv6 detection:
+    # old staged split entries may have ipv6_support=0 even with IPv6 tunnel config.
+    if [ "$ipv6" != "1" ]; then
+        if [ -n "$pub_ipv6" ] || \
+           grep -Eq '^[[:space:]]*Address[[:space:]]*=.*:' "$conf" 2>/dev/null || \
+           grep -Eq '^[[:space:]]*AllowedIPs[[:space:]]*=.*::' "$conf" 2>/dev/null; then
+            ipv6="1"
+        fi
+    fi
     
     # Calculate uptime
     local uptime_str="-"
