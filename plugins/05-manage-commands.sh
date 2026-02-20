@@ -21,6 +21,70 @@ elif [ -f "/cfg/wg-custom/lib/wg-common.sh" ]; then
     . "/cfg/wg-custom/lib/wg-common.sh"
 fi
 
+is_ipv4_addr() {
+    [ -n "$1" ] || return 1
+    echo "$1" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+}
+
+is_ipv6_addr() {
+    [ -n "$1" ] || return 1
+    echo "$1" | grep -q ':' || return 1
+    echo "$1" | grep -Eq '^[0-9A-Fa-f:]+$'
+}
+
+get_iface_global_ipv6() {
+    local iface="$1"
+    ip -6 addr show dev "$iface" 2>/dev/null | \
+        awk '/inet6 / && !/fe80/ {split($2, a, "/"); print a[1]; exit}'
+}
+
+try_public_ip() {
+    local family="$1"
+    local bind="$2"
+    local out=""
+    if [ "$family" = "4" ]; then
+        out=$(curl -s -4 --max-time 2 --interface "$bind" ifconfig.me 2>/dev/null || true)
+        is_ipv4_addr "$out" || out=""
+    else
+        out=$(curl -s -6 --max-time 3 --interface "$bind" ifconfig.me 2>/dev/null || true)
+        if ! is_ipv6_addr "$out"; then
+            out=$(curl -s -6 --max-time 3 --interface "$bind" api64.ipify.org 2>/dev/null || true)
+            is_ipv6_addr "$out" || out=""
+        fi
+    fi
+    echo "$out"
+}
+
+fetch_public_ipv6() {
+    local iface="$1"
+    local rt="$2"
+    local pub_ipv6=""
+    local src6=""
+    local tmp_prio=48
+
+    pub_ipv6=$(try_public_ip "6" "$iface")
+    if is_ipv6_addr "$pub_ipv6"; then
+        echo "$pub_ipv6"
+        return 0
+    fi
+
+    src6=$(get_iface_global_ipv6 "$iface")
+    if [ -z "$src6" ] || [ -z "$rt" ]; then
+        return 1
+    fi
+
+    # Router-origin probes are not fwmarked; add a narrow temporary source rule.
+    ip -6 rule add from "${src6}/128" table "$rt" priority "$tmp_prio" 2>/dev/null || true
+    pub_ipv6=$(try_public_ip "6" "$src6")
+    ip -6 rule del from "${src6}/128" table "$rt" priority "$tmp_prio" 2>/dev/null || true
+
+    if is_ipv6_addr "$pub_ipv6"; then
+        echo "$pub_ipv6"
+        return 0
+    fi
+    return 1
+}
+
 # Hook: Display available commands in usage/help
 show_plugin_help() {
     echo ""
@@ -131,6 +195,7 @@ cmd_status_all() {
     for iface in $all_ifaces; do
         if ip link show "$iface" >/dev/null 2>&1; then
             (curl -4 -s --max-time 2 --interface "$iface" ifconfig.me > "${WG_TMP_DIR}/wg_pub_ip_${iface}" 2>/dev/null) &
+            (curl -6 -s --max-time 2 --interface "$iface" ifconfig.me > "${WG_TMP_DIR}/wg_pub_ip6_${iface}" 2>/dev/null) &
         fi
     done
     
@@ -176,15 +241,30 @@ cmd_status() {
     
     if ip link show "$iface" >/dev/null 2>&1; then
         iface_status_display="Active ✅"
-        pub_ipv6=$(ip -6 addr show "$iface" 2>/dev/null | awk '/inet6 / && !/fe80/ {split($2,a,"/"); print a[1]}' | head -1)
-        
         # Check for pre-fetched public IP or fetch
         local tmp_ip="${WG_TMP_DIR}/wg_pub_ip_${iface}"
         if [ -s "$tmp_ip" ]; then
-            pub_ipv4=$(cat "$tmp_ip")
+            local cached_ip
+            cached_ip=$(cat "$tmp_ip")
+            if is_ipv4_addr "$cached_ip"; then
+                pub_ipv4="$cached_ip"
+            fi
             rm -f "$tmp_ip" 2>/dev/null
         else
-            pub_ipv4=$(curl -4 -s --max-time 2 --interface "$iface" ifconfig.me 2>/dev/null)
+            pub_ipv4=$(try_public_ip "4" "$iface")
+        fi
+
+        local tmp_ip6="${WG_TMP_DIR}/wg_pub_ip6_${iface}"
+        if [ -s "$tmp_ip6" ]; then
+            local cached_ip6
+            cached_ip6=$(cat "$tmp_ip6")
+            if is_ipv6_addr "$cached_ip6"; then
+                pub_ipv6="$cached_ip6"
+            fi
+            rm -f "$tmp_ip6" 2>/dev/null
+        fi
+        if [ -z "$pub_ipv6" ]; then
+            pub_ipv6=$(fetch_public_ipv6 "$iface" "$rt" || true)
         fi
     fi
 
