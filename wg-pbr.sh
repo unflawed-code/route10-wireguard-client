@@ -977,6 +977,51 @@ BLOCK_CHAIN="${WG_INTERFACE}_ipv6_block"
 BLOCK_IPV4_ONLY_CHAIN="${WG_INTERFACE}_ipv4_only_block"
 BLOCK_IPV6_DNS_INPUT_CHAIN="${WG_INTERFACE}_v6_dns_in"
 
+# Per-interface hotplug storm guard.
+GUARD_STATE="${WG_TMP_DIR}/iface_${WG_INTERFACE}.guard"
+GUARD_LAST="${WG_TMP_DIR}/iface_${WG_INTERFACE}.last"
+NOW=$(date +%s 2>/dev/null)
+[ -n "$NOW" ] || NOW=0
+WINDOW=15
+BURST=20
+COOLDOWN=30
+DEDUP=2
+EVENT_KEY="${ACTION}|${INTERFACE}"
+WIN_START=0
+COUNT=0
+SUPPRESS_UNTIL=0
+if [ -f "$GUARD_STATE" ]; then
+    IFS='|' read -r WIN_START COUNT SUPPRESS_UNTIL < "$GUARD_STATE"
+fi
+case "$WIN_START" in ''|*[!0-9]*) WIN_START=0 ;; esac
+case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
+case "$SUPPRESS_UNTIL" in ''|*[!0-9]*) SUPPRESS_UNTIL=0 ;; esac
+if [ "$SUPPRESS_UNTIL" -gt "$NOW" ]; then
+    logger -t wireguard "[$WG_INTERFACE] Hotplug storm guard active; skipping $ACTION"
+    exit 0
+fi
+if [ -f "$GUARD_LAST" ]; then
+    IFS='|' read -r LAST_TS LAST_KEY < "$GUARD_LAST"
+    case "$LAST_TS" in ''|*[!0-9]*) LAST_TS=0 ;; esac
+    if [ "$LAST_KEY" = "$EVENT_KEY" ] && [ $((NOW - LAST_TS)) -lt "$DEDUP" ]; then
+        exit 0
+    fi
+fi
+printf "%s|%s\n" "$NOW" "$EVENT_KEY" > "$GUARD_LAST"
+if [ "$WIN_START" -eq 0 ] || [ $((NOW - WIN_START)) -ge "$WINDOW" ]; then
+    WIN_START="$NOW"
+    COUNT=1
+else
+    COUNT=$((COUNT + 1))
+fi
+if [ "$COUNT" -gt "$BURST" ]; then
+    SUPPRESS_UNTIL=$((NOW + COOLDOWN))
+    printf "%s|%s|%s\n" "$WIN_START" "$COUNT" "$SUPPRESS_UNTIL" > "$GUARD_STATE"
+    logger -t wireguard "[$WG_INTERFACE] Hotplug storm detected (count=$COUNT window=${WINDOW}s); cooling down ${COOLDOWN}s"
+    exit 0
+fi
+printf "%s|%s|0\n" "$WIN_START" "$COUNT" > "$GUARD_STATE"
+
 # === INJECTED COMMON LIBRARY ===
 COMMON_LIB_PLACEHOLDER
 

@@ -303,10 +303,17 @@ cmd_status() {
         is_split=1
     fi
     
-    # Print header (+2 for 4-byte 🔗)
-    echo "+-----------------------------------------------------------------------+"
-    printf "| %-71s |\n" "$iface 🔗"
-    echo "+------------------+----------------------------------------------------+"
+    status_print_row() {
+        local label="$1"
+        local value="$2"
+        local width="${3:-51}"
+        printf "│ %-16s │ %-${width}s │\n" "$label" "$value"
+    }
+
+    # Print header
+    echo "┌───────────────────────────────────────────────────────────────────────┐"
+    printf "│ %-71s │\n" "$iface 🔗"
+    echo "├──────────────────┬────────────────────────────────────────────────────┤"
     
     # Interface section
     # Label col: 16 visual | Value col: 50 visual
@@ -316,48 +323,48 @@ cmd_status() {
     # To align with 50-char width: %-50s works if the emoji is treated correctly.
     # However, 'printf' usually counts bytes. 
     
-    printf "| %-16s | %-51s |\n" "Status" "$iface_status_display"
+    status_print_row "Status" "$iface_status_display" 51
     
     local mode_padding=52
     if echo "$mode_display" | grep -q "Split-Tunnel"; then
          mode_padding=55
     fi
-    printf "| %-16s | %-${mode_padding}s |\n" "Mode" "$mode_display"
+    status_print_row "Mode" "$mode_display" "$mode_padding"
     
     # Calculate padding for Uptime based on emoji presence (⏱️ is ~6 bytes but 2 columns)
     local uptime_padding=50
     if echo "$uptime_str" | grep -q "⏱️"; then
         uptime_padding=54
     fi
-    printf "| %-16s | %-${uptime_padding}s |\n" "Uptime" "$uptime_str"
+    status_print_row "Uptime" "$uptime_str" "$uptime_padding"
     
     # Staged row - emojis used
     local staged_display="$([ "$committed" = "1" ] && echo "Committed ✅" || echo "Pending ⏳")"
-    printf "| %-16s | %-51s |\n" "Staged" "$staged_display"
+    status_print_row "Staged" "$staged_display" 51
     
     # Network section
-    echo "+------------------+----------------------------------------------------+"
-    printf "| %-16s | %-50s |\n" "Routing Table" "$rt (${iface}_rt)"
+    echo "├──────────────────┼────────────────────────────────────────────────────┤"
+    status_print_row "Routing Table" "$rt (${iface}_rt)" 50
     
     local ipv6_display="$([ "$ipv6" = "1" ] && echo "Yes ✅" || echo "No ❌")"
-    printf "| %-16s | %-51s |\n" "IPv6 Support" "$ipv6_display"
-    [ "$nat66" = "1" ] && printf "| %-16s | %-51s |\n" "NAT66" "Enabled ✅"
-    [ -n "$pub_ipv4" ] && printf "| %-16s | %-50s |\n" "Public IPv4" "$pub_ipv4"
-    [ -n "$pub_ipv6" ] && printf "| %-16s | %-50s |\n" "Public IPv6" "$pub_ipv6"
+    status_print_row "IPv6 Support" "$ipv6_display" 51
+    [ "$nat66" = "1" ] && status_print_row "NAT66" "Enabled ✅" 51
+    [ -n "$pub_ipv4" ] && status_print_row "Public IPv4" "$pub_ipv4" 50
+    [ -n "$pub_ipv6" ] && status_print_row "Public IPv6" "$pub_ipv6" 50
     
     # Targets section
-    echo "+------------------+----------------------------------------------------+"
+    echo "├──────────────────┼────────────────────────────────────────────────────┤"
     if [ "$is_split" = "1" ]; then
         local first=1
         for domain in $(echo "$domains" | tr ',' ' '); do
             if [ "$first" = "1" ]; then
-                printf "| %-16s | %-50s |\n" "Domains" "$domain"
+                status_print_row "Domains" "$domain" 50
                 first=0
             else
-                printf "| %-16s | %-50s |\n" "" "$domain"
+                status_print_row "" "$domain" 50
             fi
         done
-        [ "$first" = "1" ] && printf "| %-16s | %-50s |\n" "Domains" "(None)"
+        [ "$first" = "1" ] && status_print_row "Domains" "(None)" 50
     else
         if [ -n "$vpn_ips" ] && [ "$vpn_ips" != "" ] && [ "$vpn_ips" != "none" ]; then
             local first=1
@@ -368,51 +375,51 @@ cmd_status() {
                         local mac="${target%%=*}"
                         local resolved="${target#*=}"
                         if [ "$first" = "1" ]; then
-                            printf "| %-16s | %-50s |\n" "Targets" "$mac -> $resolved"
+                            status_print_row "Targets" "$mac -> $resolved" 50
                             first=0
                         else
-                            printf "| %-16s | %-50s |\n" "" "$mac -> $resolved"
+                            status_print_row "" "$mac -> $resolved" 50
                         fi
                         ;;
                     *)
                         # Plain IP/subnet
                         if [ "$first" = "1" ]; then
-                            printf "| %-16s | %-50s |\n" "Targets" "$target"
+                            status_print_row "Targets" "$target" 50
                             first=0
                         else
-                            printf "| %-16s | %-50s |\n" "" "$target"
+                            status_print_row "" "$target" 50
                         fi
                         ;;
                 esac
             done
         else
-            printf "| %-16s | %-50s |\n" "Targets" "(No targets)"
+            status_print_row "Targets" "(No targets)" 50
         fi
     fi
     
     # Config section - Multi-line wrapping for long paths
-    echo "+------------------+----------------------------------------------------+"
+    echo "├──────────────────┼────────────────────────────────────────────────────┤"
     if [ -n "$conf" ]; then
         local val_w=50
         if [ ${#conf} -le $val_w ]; then
-            printf "| %-16s | %-50s |\n" "Config" "$conf"
+            status_print_row "Config" "$conf" 50
         else
             # Wrap long path
             local start=1
             while [ $start -le ${#conf} ]; do
                 local chunk=$(echo "$conf" | cut -c $start-$((start + val_w - 1)))
                 if [ $start -eq 1 ]; then
-                    printf "| %-16s | %-50s |\n" "Config" "$chunk"
+                    status_print_row "Config" "$chunk" 50
                 else
-                    printf "| %-16s | %-50s |\n" "" "$chunk"
+                    status_print_row "" "$chunk" 50
                 fi
                 start=$((start + val_w))
             done
         fi
     fi
-    [ -n "$ip6_subs" ] && [ "$ip6_subs" != "" ] && printf "| %-16s | %-50s |\n" "IPv6 Subnets" "$ip6_subs"
+    [ -n "$ip6_subs" ] && [ "$ip6_subs" != "" ] && status_print_row "IPv6 Subnets" "$ip6_subs" 50
     
-    echo "+-----------------------------------------------------------------------+"
+    echo "└──────────────────┴────────────────────────────────────────────────────┘"
 }
 
 # REMOVE-IP command - Accumulates removals from STAGED targets until commit
